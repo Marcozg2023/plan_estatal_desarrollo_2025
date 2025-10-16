@@ -133,7 +133,7 @@ def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
     if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")): return "saludo"
     if "ayuda" in t or "help" in t or "comandos" in t: return "ayuda"
-    if "info" in t or "plan estatal" in t or "ped" in t: return "info"
+    if "info" in t or "plan estatal" in t o r "ped" in t: return "info"
     if t.startswith("municipio ") or t.startswith("municipio:") or len(t.split()) <= 4: return "municipio"
     return "fallback"
 
@@ -270,7 +270,7 @@ async def _tg_delete_webhook() -> Dict[str, Any]:
         r = await client.post(f"{API_URL}/deleteWebhook")
         return r.json()
 
-# Acepta GET y POST para que puedas usar el navegador
+# Aceptar GET y POST para poder usar navegador o POSTman
 @app.api_route("/set-webhook", methods=["GET", "POST"])
 async def set_webhook():
     if not WEBHOOK_URL:
