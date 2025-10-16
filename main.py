@@ -133,7 +133,7 @@ def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
     if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")): return "saludo"
     if "ayuda" in t or "help" in t or "comandos" in t: return "ayuda"
-    if "info" in t or "plan estatal" in t o r "ped" in t: return "info"
+    if "info" in t or "plan estatal" in t or "ped" in t: return "info"   # ← corregido
     if t.startswith("municipio ") or t.startswith("municipio:") or len(t.split()) <= 4: return "municipio"
     return "fallback"
 
