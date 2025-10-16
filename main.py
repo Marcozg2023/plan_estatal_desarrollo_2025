@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os, re, time, csv, io, sqlite3
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException, Query
 
@@ -19,7 +19,7 @@ SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.2.0")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.2.1")
 
 # ========= DB (SQLite) =========
 def db():
@@ -30,7 +30,6 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
-    # Primer municipio solicitado por chat (bloqueo)
     c.execute("""
     CREATE TABLE IF NOT EXISTS user_municipio (
         chat_id TEXT PRIMARY KEY,
@@ -82,6 +81,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
         r.raise_for_status()
         content = r.content.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(content))
+
     # detectar columna de municipio (tolerante)
     headers_map = {h.lower().strip(): h for h in (reader.fieldnames or [])}
     field_actual = headers_map.get(SHEETS_FIELD_MUNICIPIO.lower())
@@ -92,6 +92,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
                 break
     if not field_actual:
         return {}
+
     counts: Dict[str, int] = {}
     for row in reader:
         mun = (row.get(field_actual) or "").strip()
@@ -123,7 +124,8 @@ async def get_municipio_count(nombre: str) -> int:
 
 # ========= Telegram helpers =========
 async def send_message(chat_id: int, text: str):
-    if not API_URL: return
+    if not API_URL:
+        return
     async with httpx.AsyncClient(timeout=20) as client:
         await client.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
 
@@ -165,13 +167,13 @@ def admin_get_user_municipio(chat_id: str = Query(..., description="chat_id num�
     mun = get_user_municipio(str(chat_id))
     return {"chat_id": chat_id, "municipio": mun}
 
-# Admin: resetear municipio de un chat (permite que el usuario elija otro)
+# Admin: resetear municipio de un chat
 @app.post("/admin/reset-user-municipio")
 def admin_reset_user_municipio(chat_id: str = Query(...)):
     removed = reset_user_municipio(str(chat_id))
     return {"chat_id": chat_id, "reset": bool(removed)}
 
-# Webhook Telegram
+# Webhook de Telegram
 @app.post("/webhook")
 async def telegram_webhook(
     request: Request,
@@ -191,18 +193,22 @@ async def telegram_webhook(
     intent = detect_intent(text or "")
 
     if intent == "saludo":
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             "¡Hola! Soy tu asistente del Plan Estatal de Desarrollo.\n"
             "Escribe *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
-            "Nota: Solo puedes registrar *un municipio* por chat.")
+            "Nota: Solo puedes registrar *un municipio* por chat."
+        )
         return {"ok": True}
 
     if intent == "ayuda":
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             "Comandos:\n"
             "• hola / ayuda / info\n"
             "• municipio <Nombre>  (ej. *municipio Tulancingo*)\n"
-            "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat.")
+            "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat."
+        )
         return {"ok": True}
 
     if intent == "info":
@@ -218,21 +224,20 @@ async def telegram_webhook(
         ya_registrado = get_user_municipio(chat_key)
 
         if ya_registrado:
-            # Ya tiene municipio fijado → solo devuelve ese
             n = await get_municipio_count(ya_registrado)
-            await send_message(chat_id,
+            await send_message(
+                chat_id,
                 f"Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n"
-                "Si crees que es un error, solicita a un administrador que lo restablezca.")
+                "Si crees que es un error, solicita a un administrador que lo restablezca."
+            )
             return {"ok": True}
 
-        # No registrado aún → toma el primero que pida y lo fija
         nombre = extract_municipio(text or "")
         if not nombre:
             await send_message(chat_id, "Escríbeme así: *municipio Pachuca*")
             return {"ok": True}
 
         n = await get_municipio_count(nombre)
-        # Fijamos tal como venga en datos (si el match aproximado encuentra otro nombre, lo respetamos)
         counts = await get_counts_cached()
         elegido = nombre
         for k in counts.keys():
@@ -247,12 +252,13 @@ async def telegram_webhook(
     await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe *ayuda* para ver opciones.")
     return {"ok": True}
 
-# Utilidades set/delete webhook
+# ========= Utilidades set/delete webhook =========
 async def _tg_set_webhook(url: str, secret: str = "") -> Dict[str, Any]:
     if not API_URL:
         raise HTTPException(status_code=400, detail="BOT_TOKEN no configurado")
     data = {"url": url}
-    if secret: data["secret_token"] = secret
+    if secret:
+        data["secret_token"] = secret
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{API_URL}/setWebhook", data=data)
         return r.json()
@@ -264,12 +270,13 @@ async def _tg_delete_webhook() -> Dict[str, Any]:
         r = await client.post(f"{API_URL}/deleteWebhook")
         return r.json()
 
-@app.post("/set-webhook")
+# Acepta GET y POST para que puedas usar el navegador
+@app.api_route("/set-webhook", methods=["GET", "POST"])
 async def set_webhook():
     if not WEBHOOK_URL:
         raise HTTPException(status_code=400, detail="Define TELEGRAM_WEBHOOK_URL")
     return await _tg_set_webhook(WEBHOOK_URL, WEBHOOK_SECRET)
 
-@app.post("/delete-webhook")
+@app.api_route("/delete-webhook", methods=["GET", "POST"])
 async def delete_webhook():
     return await _tg_delete_webhook()
