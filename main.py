@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import os, re, time, csv, io, sqlite3
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import httpx
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-# ========= Variables de entorno =========
+# =========================
+# Variables de entorno
+# =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()
@@ -19,35 +21,35 @@ SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip(
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED Hidalgo", version="2.2")
+app = FastAPI(title="Chatbot PED Hidalgo", version="2.3")
 
-# ========= Listado oficial =========
+# =========================
+# Listado oficial (84 municipios, sin números)
+# =========================
 MUNICIPIOS_OFICIALES = [
-    "Acatlán", "Acaxochitlán", "Actopan", "Agua Blanca de Iturbide",
-    "Ajacuba", "Alfajayucan", "Almoloya", "Apan", "El Arenal", "Atitalaquia",
-    "Atlapexco", "Atotonilco de Tula", "Atotonilco el Grande", "Calnali",
-    "Cardonal", "Cuautepec de Hinojosa", "Chapantongo", "Chapulhuacán",
-    "Chilcuautla", "Eloxochitlán", "Emiliano Zapata", "Epazoyucan",
-    "Francisco I. Madero", "Huasca de Ocampo", "Huautla", "Huazalingo",
-    "Huehuetla", "Huejutla de Reyes", "Huichapan", "Ixmiquilpan",
-    "Jacala de Ledezma", "Jaltocán", "Juárez Hidalgo", "Lolotla",
-    "Metepec", "San Agustín Metzquititlán", "Metztitlán", "Mineral del Chico",
-    "Mineral del Monte", "La Misión", "Mixquiahuala de Juárez",
-    "Molango de Escamilla", "Nicolás Flores", "Nopala de Villagrán",
-    "Omitlán de Juárez", "San Felipe Orizatlán", "Pacula", "Pachuca de Soto",
-    "Pisaflores", "Progreso de Obregón", "Mineral de la Reforma",
-    "San Agustín Tlaxiaca", "San Bartolo Tutotepec", "San Salvador",
-    "Santiago de Anaya", "Santiago Tulantepec de Lugo Guerrero",
-    "Singuilucan", "Tasquillo", "Tecozautla", "Tenango de Doria",
-    "Tepeapulco", "Tepehuacán de Guerrero", "Tepeji del Río de Ocampo",
-    "Tepetitlán", "Tetepango", "Villa de Tezontepec", "Tezontepec de Aldama",
-    "Tianguistengo", "Tizayuca", "Tlahuelilpan", "Tlahuiltepa",
-    "Tlanalapa", "Tlanchinol", "Tlaxcoapan", "Tolcayuca", "Tula de Allende",
-    "Tulancingo de Bravo", "Xochiatipan", "Xochicoatlán", "Yahualica",
-    "Zacualtipán de Ángeles", "Zapotlán de Juárez", "Zempoala", "Zimapán"
+    "Acatlán","Acaxochitlán","Actopan","Agua Blanca de Iturbide","Ajacuba","Alfajayucan",
+    "Almoloya","Apan","El Arenal","Atitalaquia","Atlapexco","Atotonilco de Tula",
+    "Atotonilco el Grande","Calnali","Cardonal","Cuautepec de Hinojosa","Chapantongo",
+    "Chapulhuacán","Chilcuautla","Eloxochitlán","Emiliano Zapata","Epazoyucan",
+    "Francisco I. Madero","Huasca de Ocampo","Huautla","Huazalingo","Huehuetla",
+    "Huejutla de Reyes","Huichapan","Ixmiquilpan","Jacala de Ledezma","Jaltocán",
+    "Juárez Hidalgo","Lolotla","Metepec","San Agustín Metzquititlán","Metztitlán",
+    "Mineral del Chico","Mineral del Monte","La Misión","Mixquiahuala de Juárez",
+    "Molango de Escamilla","Nicolás Flores","Nopala de Villagrán","Omitlán de Juárez",
+    "San Felipe Orizatlán","Pacula","Pachuca de Soto","Pisaflores","Progreso de Obregón",
+    "Mineral de la Reforma","San Agustín Tlaxiaca","San Bartolo Tutotepec","San Salvador",
+    "Santiago de Anaya","Santiago Tulantepec de Lugo Guerrero","Singuilucan","Tasquillo",
+    "Tecozautla","Tenango de Doria","Tepeapulco","Tepehuacán de Guerrero",
+    "Tepeji del Río de Ocampo","Tepetitlán","Tetepango","Villa de Tezontepec",
+    "Tezontepec de Aldama","Tianguistengo","Tizayuca","Tlahuelilpan","Tlahuiltepa",
+    "Tlanalapa","Tlanchinol","Tlaxcoapan","Tolcayuca","Tula de Allende","Tulancingo de Bravo",
+    "Xochiatipan","Xochicoatlán","Yahualica","Zacualtipán de Ángeles","Zapotlán de Juárez",
+    "Zempoala","Zimapán"
 ]
 
-# ========= DB =========
+# =========================
+# DB (SQLite)
+# =========================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -61,7 +63,7 @@ def init_db():
         chat_id TEXT PRIMARY KEY,
         municipio TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
+    );
     """)
     conn.commit()
     conn.close()
@@ -84,7 +86,9 @@ def reset_user_municipio(chat_id: str) -> int:
     conn.close()
     return n
 
-# ========= Cache CSV =========
+# =========================
+# Utilidades CSV + cache
+# =========================
 _cache_counts: Dict[str, int] = {}
 _cache_last_fetch: float = 0.0
 
@@ -102,7 +106,6 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
         content = r.content.decode("utf-8", errors="replace")
     except Exception:
         return {}
-
     reader = csv.DictReader(io.StringIO(content))
     counts: Dict[str, int] = {}
     for row in reader:
@@ -111,7 +114,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
             counts[mun] = counts.get(mun, 0) + 1
     return counts
 
-async def get_counts_cached(force=False) -> Dict[str, int]:
+async def get_counts_cached(force: bool = False) -> Dict[str, int]:
     global _cache_counts, _cache_last_fetch
     now = time.time()
     if force or (now - _cache_last_fetch > SHEETS_CACHE_TTL) or not _cache_counts:
@@ -121,7 +124,9 @@ async def get_counts_cached(force=False) -> Dict[str, int]:
             _cache_last_fetch = now
     return _cache_counts
 
-# ========= Fuzzy matching =========
+# =========================
+# Fuzzy matching (sugerencia)
+# =========================
 def _levenshtein(a: str, b: str) -> int:
     a, b = a.lower(), b.lower()
     if a == b: return 0
@@ -131,33 +136,36 @@ def _levenshtein(a: str, b: str) -> int:
     for i, ca in enumerate(a, 1):
         curr = [i]
         for j, cb in enumerate(b, 1):
-            ins = prev[j] + 1
-            dele = curr[j-1] + 1
-            sub = prev[j-1] + (ca != cb)
-            curr.append(min(ins, dele, sub))
+            curr.append(min(prev[j]+1, curr[j-1]+1, prev[j-1] + (ca != cb)))
         prev = curr
     return prev[-1]
 
-def sugerir_municipio(user_text: str, max_dist=2) -> Optional[str]:
-    mejor, dist = None, 999
-    for m in MUNICIPIOS_OFICIALES:
-        d = _levenshtein(user_text, m)
-        if d < dist:
-            mejor, dist = m, d
-    return mejor if dist <= max_dist else None
-
-def validar_municipio(user_text: str) -> tuple[Optional[str], Optional[str]]:
-    """Devuelve (coincidencia_exacta, sugerencia)"""
-    t = user_text.strip().lower()
+def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
+    """Devuelve (exacto, sugerido). Exacto = nombre oficial exacto; sugerido = mejor match si dist<=max_dist."""
+    t = (user_text or "").strip().lower()
+    # exacto
     for m in MUNICIPIOS_OFICIALES:
         if t == m.lower():
             return m, None
-    sugerido = sugerir_municipio(t)
-    if sugerido:
-        return None, sugerido
-    return None, None
+    # sugerencia
+    mejor, dist = None, 999
+    for m in MUNICIPIOS_OFICIALES:
+        d = _levenshtein(t, m)
+        if d < dist:
+            mejor, dist = m, d
+    return (None, mejor) if (mejor and dist <= max_dist) else (None, None)
 
-# ========= Telegram helpers =========
+# =========================
+# Telegram helpers
+# =========================
+def reply_keyboard() -> Dict[str, Any]:
+    return {
+        "keyboard": [[{"text": "/ayuda"}, {"text": "/refrescar"}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True,
+    }
+
 def inline_consultar_de_nuevo(muni: str) -> Dict[str, Any]:
     return {"inline_keyboard": [[{"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{muni}"}]]}
 
@@ -167,6 +175,8 @@ def inline_only_corregir() -> Dict[str, Any]:
 async def send_message(chat_id: int, text: str,
                        parse_mode: Optional[str] = "Markdown",
                        reply_markup: Optional[Dict[str, Any]] = None):
+    if not API_URL:
+        return
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode: payload["parse_mode"] = parse_mode
     if reply_markup: payload["reply_markup"] = reply_markup
@@ -176,15 +186,73 @@ async def send_message(chat_id: int, text: str,
     except Exception as e:
         print(f"[send_message] {e}")
 
-# ========= Webhook =========
-@app.post("/webhook")
-async def telegram_webhook(request: Request,
-    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
+# =========================
+# Health / Root
+# =========================
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Servicio del Chatbot PED en línea 🚀", "endpoints": ["/healthz", "/set-webhook", "/delete-webhook", "/webhook"]}
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+# =========================
+# Webhook Telegram
+# =========================
+@app.post("/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    # valida secret (si se configuró)
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         return JSONResponse({"ok": True})
 
     update = await request.json()
+
+    # Inline callbacks
+    callback = update.get("callback_query")
+    if callback:
+        cb_id = callback.get("id")
+        data = callback.get("data") or ""
+        message = callback.get("message") or {}
+        chat_id = ((message.get("chat") or {}).get("id")) or None
+
+        async def answer_cb(text: Optional[str] = None, alert: bool = False):
+            if not API_URL or not cb_id: return
+            payload = {"callback_query_id": cb_id}
+            if text: payload.update({"text": text, "show_alert": alert})
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(f"{API_URL}/answerCallbackQuery", json=payload)
+            except Exception as e:
+                print(f"[answer_cb] {e}")
+
+        if data.startswith("consultar:") and chat_id:
+            muni = data.split(":", 1)[1]
+            counts = await get_counts_cached()
+            n = 0
+            for k, v in counts.items():
+                if normalize(k) == normalize(muni):
+                    n = v
+                    break
+            await answer_cb()
+            await send_message(chat_id, f"🔄 Consulta actualizada para *{muni}*:\n\nActualmente lleva {n} registro(s).",
+                               reply_markup=inline_consultar_de_nuevo(muni))
+            return {"ok": True}
+
+        if data == "invalid_reset" and chat_id:
+            reset_user_municipio(str(chat_id))
+            await answer_cb()
+            await send_message(chat_id, "🧹 Listo. Vuelve a escribir tu municipio.\n\nEjemplo: *municipio Pachuca de Soto*",
+                               reply_markup=reply_keyboard())
+            return {"ok": True}
+
+        await answer_cb()
+        return {"ok": True}
+
+    # Mensajes de texto
     message = update.get("message") or {}
     text = message.get("text", "")
     chat = message.get("chat") or {}
@@ -193,7 +261,50 @@ async def telegram_webhook(request: Request,
     if not chat_id or not text:
         return {"ok": True}
 
-    if text.lower().startswith("municipio"):
+    t = text.strip().lower()
+
+    # Comandos
+    if t.startswith("/start"):
+        counts = await get_counts_cached()
+        total = sum(counts.values()) if counts else 0
+        await send_message(chat_id,
+            "¡Hola! 👋\n"
+            "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
+            "📍 Escríbeme: *municipio Pachuca de Soto* (por ejemplo) para ver su conteo.\n\n"
+            f"📊 **Registros totales a nivel estatal: {total}**",
+            reply_markup=reply_keyboard())
+        return {"ok": True}
+
+    if t.startswith("/ayuda"):
+        await send_message(chat_id,
+            "🧭 *Menú de ayuda*\n\n"
+            "• Para consultar escribe: *municipio Pachuca de Soto* (cámbialo por tu municipio).\n"
+            "• Para refrescar los datos: */refrescar*\n"
+            "• Para ver tu ID: */id*\n\n"
+            "📌 Nota: el nombre se valida contra el *listado oficial de 84 municipios*. Si hay un error de ortografía te sugeriré el nombre correcto.",
+            reply_markup=reply_keyboard())
+        return {"ok": True}
+
+    if t.startswith("/refrescar"):
+        await get_counts_cached(force=True)
+        await send_message(chat_id, "🔄 Cache actualizado.", reply_markup=reply_keyboard())
+        return {"ok": True}
+
+    if t.startswith("/id"):
+        await send_message(chat_id, f"🆔 Tu chat_id es: `{chat_id}`")
+        return {"ok": True}
+
+    if t.startswith("/reset"):
+        if ADMIN_CHAT_ID and chat_id == ADMIN_CHAT_ID:
+            removed = reset_user_municipio(str(chat_id))
+            msg = "✅ Municipio restablecido." if removed else "No tenías municipio registrado."
+            await send_message(chat_id, msg)
+        else:
+            await send_message(chat_id, "⚠️ Este comando es solo para administradores.")
+        return {"ok": True}
+
+    # Intent "municipio ..."
+    if t.startswith("municipio"):
         nombre = text.split(" ", 1)[1] if " " in text else ""
         exacto, sugerido = validar_municipio(nombre)
 
@@ -213,6 +324,7 @@ async def telegram_webhook(request: Request,
             return {"ok": True}
 
         oficial = exacto or sugerido
+        # Conteo desde CSV (0 si no está)
         counts = await get_counts_cached()
         n = 0
         for k, v in counts.items():
@@ -222,9 +334,40 @@ async def telegram_webhook(request: Request,
 
         set_user_municipio(str(chat_id), oficial)
         await send_message(chat_id,
-            f"✅ Registré *{oficial}* para este chat.\n\n"
-            f"Actualmente lleva {n} registro(s).",
+            f"✅ Registré *{oficial}* para este chat.\n\nActualmente lleva {n} registro(s).",
             reply_markup=inline_consultar_de_nuevo(oficial))
         return {"ok": True}
 
+    # Despedidas tiernas
+    if any(w in t for w in ("gracias", "adios", "adiós", "bye", "hasta luego", "nos vemos")):
+        await send_message(chat_id,
+            "🙏 *Gracias por tu colaboración y esfuerzo.*\n\n"
+            "Tu participación fortalece la actualización del Plan Estatal de Desarrollo 2025-2028.",
+            reply_markup=reply_keyboard())
+        return {"ok": True}
+
+    # Fallback
+    await send_message(chat_id, "🤔 No entendí. Escribe *municipio Pachuca de Soto* o */ayuda*.", reply_markup=reply_keyboard())
     return {"ok": True}
+
+# =========================
+# Utilería: set/delete webhook
+# =========================
+@app.get("/set-webhook")
+async def set_webhook():
+    if not BOT_TOKEN or not WEBHOOK_URL:
+        raise HTTPException(status_code=400, detail="Falta TELEGRAM_BOT_TOKEN o WEBHOOK_URL")
+    data = {"url": f"{WEBHOOK_URL}/webhook"}
+    if WEBHOOK_SECRET:
+        data["secret_token"] = WEBHOOK_SECRET
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/setWebhook", json=data)
+        return r.json()
+
+@app.get("/delete-webhook")
+async def delete_webhook():
+    if not BOT_TOKEN:
+        raise HTTPException(status_code=400, detail="Falta TELEGRAM_BOT_TOKEN")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"{API_URL}/deleteWebhook")
+        return r.json()
