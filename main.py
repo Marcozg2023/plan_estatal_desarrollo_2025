@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
+WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")  # URL completa pública hacia /webhook
 
 # Google Sheets (CSV publicado)
 SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()  # pub?output=csv&gid=... o export?format=csv&gid=...
@@ -21,7 +21,7 @@ SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.2.2")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.0")
 
 # ========= DB (SQLite) =========
 def db():
@@ -78,7 +78,7 @@ def normalize(s: str) -> str:
 async def fetch_counts_from_sheets() -> Dict[str, int]:
     """
     Descarga el CSV del Sheet con follow_redirects=True para tolerar 307/308.
-    NO usamos raise_for_status para no romper el webhook; en su lugar devolvemos {} y logeamos.
+    NO usamos raise_for_status para no romper el webhook; si no es 200 devolvemos {} y logeamos.
     """
     if not SHEETS_CSV_URL:
         return {}
@@ -86,7 +86,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
         async with httpx.AsyncClient(
             timeout=60,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"}  # ayuda con endpoints de Google
+            headers={"User-Agent": "Mozilla/5.0"}
         ) as client:
             r = await client.get(SHEETS_CSV_URL)
 
@@ -102,7 +102,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
 
     reader = csv.DictReader(io.StringIO(content))
 
-    # detectar columna de municipio (tolerante a mayúsculas/variantes)
+    # detectar columna de municipio (tolerante)
     headers_map = { (h or "").lower().strip(): (h or "") for h in (reader.fieldnames or []) }
     field_actual = headers_map.get(SHEETS_FIELD_MUNICIPIO.lower())
     if not field_actual:
@@ -161,10 +161,23 @@ async def send_message(chat_id: int, text: str):
 
 def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
-    if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")): return "saludo"
-    if "ayuda" in t or "help" in t or "comandos" in t: return "ayuda"
-    if "info" in t or "plan estatal" in t or "ped" in t: return "info"
-    if t.startswith("municipio ") or t.startswith("municipio:") or len(t.split()) <= 4: return "municipio"
+
+    # comandos primero
+    if t.startswith("/start"): return "start"
+    if t.startswith("/ayuda") or t == "ayuda" or t == "/help": return "ayuda"
+    if t.startswith("/info") or "plan estatal" in t or "ped" in t: return "info"
+    if t.startswith("/reset"): return "reset"
+    if t.startswith("/refrescar"): return "refrescar"
+    if t.startswith("/id"): return "id"
+
+    # solo "municipio" si inicia con esa palabra
+    if re.match(r"^\s*municipio(\s|:)", t):
+        return "municipio"
+
+    # saludos
+    if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")):
+        return "saludo"
+
     return "fallback"
 
 def extract_municipio(text: str) -> Optional[str]:
@@ -214,7 +227,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
-    # Si configuraste secret, valida. Si es inválido, no rompas el endpoint.
+    # valida secret si aplicable (pero no rompas el endpoint)
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         print("[webhook] invalid secret token")
         return JSONResponse({"ok": True})
@@ -230,12 +243,14 @@ async def telegram_webhook(
 
         intent = detect_intent(text or "")
 
-        if intent == "saludo":
+        if intent == "start":
+            counts = await get_counts_cached()
+            total = sum(counts.values()) if counts else 0
             await send_message(
                 chat_id,
                 "¡Hola! Soy tu asistente del Plan Estatal de Desarrollo.\n"
-                "Escribe *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
-                "Nota: Solo puedes registrar *un municipio* por chat."
+                "Escríbeme *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
+                f"Registros totales actuales: {total}"
             )
             return {"ok": True}
 
@@ -243,7 +258,8 @@ async def telegram_webhook(
             await send_message(
                 chat_id,
                 "Comandos:\n"
-                "• hola / ayuda / info\n"
+                "• /start  • /ayuda  • /info\n"
+                "• /refrescar  • /id  • /reset\n"
                 "• municipio <Nombre>  (ej. *municipio Tulancingo*)\n"
                 "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat."
             )
@@ -251,6 +267,23 @@ async def telegram_webhook(
 
         if intent == "info":
             await send_message(chat_id, "Consulto el conteo por municipio desde una hoja de Google Sheets publicada.")
+            return {"ok": True}
+
+        if intent == "refrescar":
+            await get_counts_cached(force=True)
+            await send_message(chat_id, "🔄 Cache actualizado.")
+            return {"ok": True}
+
+        if intent == "id":
+            await send_message(chat_id, f"Tu chat_id es: {chat_id}")
+            return {"ok": True}
+
+        if intent == "reset":
+            removed = reset_user_municipio(str(chat_id))
+            if removed:
+                await send_message(chat_id, "✅ Se restableció tu municipio. Ahora envía: *municipio Pachuca*")
+            else:
+                await send_message(chat_id, "No tenías municipio registrado. Envía: *municipio Pachuca*")
             return {"ok": True}
 
         if intent == "municipio":
@@ -266,7 +299,7 @@ async def telegram_webhook(
                 await send_message(
                     chat_id,
                     f"Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n"
-                    "Si crees que es un error, solicita a un administrador que lo restablezca."
+                    "Si crees que es un error, usa /reset o solicita a un administrador que lo restablezca."
                 )
                 return {"ok": True}
 
@@ -287,12 +320,12 @@ async def telegram_webhook(
             await send_message(chat_id, f"Listo ✅. Registré *{elegido}* para este chat.\nActualmente lleva {n} registro(s).")
             return {"ok": True}
 
+        # fallback
         await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe *ayuda* para ver opciones.")
         return {"ok": True}
 
     except Exception as e:
-        # Logueamos pero NO levantamos excepción (evitamos 500)
-        print(f"[webhook] error: {e}")
+        print(f"[webhook] error: {e}")  # Loguea, pero no rompas
         return {"ok": True}
 
 # ========= Utilidades set/delete webhook =========
