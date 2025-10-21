@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")  # URL completa pública hacia /webhook
+WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")  # URL pública completa a /webhook
 
 # Google Sheets (CSV publicado)
 SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()  # pub?output=csv&gid=... o export?format=csv&gid=...
@@ -21,7 +21,7 @@ SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.0")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.1")
 
 # ========= DB (SQLite) =========
 def db():
@@ -77,8 +77,8 @@ def normalize(s: str) -> str:
 
 async def fetch_counts_from_sheets() -> Dict[str, int]:
     """
-    Descarga el CSV del Sheet con follow_redirects=True para tolerar 307/308.
-    NO usamos raise_for_status para no romper el webhook; si no es 200 devolvemos {} y logeamos.
+    Descarga el CSV del Sheet con follow_redirects=True (tolera 307/308).
+    No usamos raise_for_status; si no es 200 devolvemos {} y registramos.
     """
     if not SHEETS_CSV_URL:
         return {}
@@ -103,7 +103,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
     reader = csv.DictReader(io.StringIO(content))
 
     # detectar columna de municipio (tolerante)
-    headers_map = { (h or "").lower().strip(): (h or "") for h in (reader.fieldnames or []) }
+    headers_map = {(h or "").lower().strip(): (h or "") for h in (reader.fieldnames or [])}
     field_actual = headers_map.get(SHEETS_FIELD_MUNICIPIO.lower())
     if not field_actual:
         for k, v in headers_map.items():
@@ -148,12 +148,15 @@ async def get_municipio_count(nombre: str) -> int:
     return 0
 
 # ========= Telegram helpers =========
-async def send_message(chat_id: int, text: str):
+async def send_message(chat_id: int, text: str, parse_mode: Optional[str] = None):
     if not API_URL:
         return
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+            r = await client.post(f"{API_URL}/sendMessage", json=payload)
             if r.status_code != 200:
                 print(f"[send_message] status={r.status_code} body={r.text[:300]}")
     except Exception as e:
@@ -169,6 +172,10 @@ def detect_intent(text: str) -> str:
     if t.startswith("/reset"): return "reset"
     if t.startswith("/refrescar"): return "refrescar"
     if t.startswith("/id"): return "id"
+
+    # despedidas
+    if any(w in t for w in ("gracias", "adios", "adiós", "bye", "nos vemos", "hasta luego")):
+        return "despedida"
 
     # solo "municipio" si inicia con esa palabra
     if re.match(r"^\s*municipio(\s|:)", t):
@@ -248,9 +255,9 @@ async def telegram_webhook(
             total = sum(counts.values()) if counts else 0
             await send_message(
                 chat_id,
-                "¡Hola! Soy tu asistente del Plan Estatal de Desarrollo.\n"
+                "¡Hola! Soy tu asistente para la actualización del Plan Estatal de Desarrollo 2025-2028.\n"
                 "Escríbeme *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
-                f"Registros totales actuales: {total}"
+                f"Registros totales a nivel estatal: {total}"
             )
             return {"ok": True}
 
@@ -260,8 +267,8 @@ async def telegram_webhook(
                 "Comandos:\n"
                 "• /start  • /ayuda  • /info\n"
                 "• /refrescar  • /id  • /reset\n"
-                "• municipio <Nombre>  (ej. *municipio Tulancingo*)\n"
-                "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat."
+                "• municipio <Nombre>  (ej. municipio Tulancingo)\n"
+                "Importante: Podrás consultar solo el primer municipio que elijas en este chat."
             )
             return {"ok": True}
 
@@ -281,9 +288,16 @@ async def telegram_webhook(
         if intent == "reset":
             removed = reset_user_municipio(str(chat_id))
             if removed:
-                await send_message(chat_id, "✅ Se restableció tu municipio. Ahora envía: *municipio Pachuca*")
+                await send_message(chat_id, "✅ Se restableció tu municipio. Ahora envía: municipio Pachuca")
             else:
-                await send_message(chat_id, "No tenías municipio registrado. Envía: *municipio Pachuca*")
+                await send_message(chat_id, "No tenías municipio registrado. Envía: municipio Pachuca")
+            return {"ok": True}
+
+        if intent == "despedida":
+            await send_message(
+                chat_id,
+                "🙏 Gracias por tu colaboración y esfuerzo. Tu participación fortalece la actualización del Plan Estatal de Desarrollo 2025-2028."
+            )
             return {"ok": True}
 
         if intent == "municipio":
@@ -298,14 +312,14 @@ async def telegram_webhook(
                 n = await get_municipio_count(ya_registrado)
                 await send_message(
                     chat_id,
-                    f"Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n"
+                    f"Tu municipio registrado es {ya_registrado} y lleva {n} registro(s).\n"
                     "Si crees que es un error, usa /reset o solicita a un administrador que lo restablezca."
                 )
                 return {"ok": True}
 
             nombre = extract_municipio(text or "")
             if not nombre:
-                await send_message(chat_id, "Escríbeme así: *municipio Pachuca*")
+                await send_message(chat_id, "Escríbeme así: municipio Pachuca")
                 return {"ok": True}
 
             n = await get_municipio_count(nombre)
@@ -317,11 +331,11 @@ async def telegram_webhook(
                     break
 
             set_user_municipio(chat_key, elegido)
-            await send_message(chat_id, f"Listo ✅. Registré *{elegido}* para este chat.\nActualmente lleva {n} registro(s).")
+            await send_message(chat_id, f"Listo ✅. Registré {elegido} para este chat.\nActualmente lleva {n} registro(s).")
             return {"ok": True}
 
         # fallback
-        await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe *ayuda* para ver opciones.")
+        await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe ayuda para ver opciones.")
         return {"ok": True}
 
     except Exception as e:
