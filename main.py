@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os, re, time, csv, io, sqlite3
-from typing import Dict, Any, Optional, List, Tuple
+import os, re, time, csv, io, sqlite3, unicodedata
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
@@ -21,7 +21,7 @@ SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip(
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED Hidalgo", version="2.3")
+app = FastAPI(title="Chatbot PED Hidalgo", version="2.4")
 
 # =========================
 # Listado oficial (84 municipios, sin números)
@@ -87,13 +87,66 @@ def reset_user_municipio(chat_id: str) -> int:
     return n
 
 # =========================
-# Utilidades CSV + cache
+# Utilidades de normalización y fuzzy
+# =========================
+def strip_accents(s: str) -> str:
+    # Elimina diacríticos (tildes/ñ/ü) para comparar sin acentos
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+def normalize(s: str) -> str:
+    """
+    Normaliza para comparación:
+    - quita espacios extra
+    - pasa a minúsculas
+    - elimina acentos
+    """
+    if not s:
+        return ""
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    s = strip_accents(s).lower()
+    return s
+
+def levenshtein(a: str, b: str) -> int:
+    a, b = normalize(a), normalize(b)
+    if a == b: return 0
+    if not a: return len(b)
+    if not b: return len(a)
+    prev = list(range(len(b)+1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            curr.append(min(prev[j]+1, curr[j-1]+1, prev[j-1] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Devuelve (exacto, sugerido).
+    - exacto: nombre oficial si coincide exactamente (ignorando acentos/mayúsculas/espacios múltiples).
+    - sugerido: mejor match por distancia Levenshtein si dist <= max_dist.
+    """
+    t = normalize(user_text)
+    # exacto
+    for m in MUNICIPIOS_OFICIALES:
+        if t == normalize(m):
+            return m, None
+    # sugerido
+    mejor, dist = None, 999
+    for m in MUNICIPIOS_OFICIALES:
+        d = levenshtein(user_text, m)
+        if d < dist:
+            mejor, dist = m, d
+    return (None, mejor) if (mejor and dist <= max_dist) else (None, None)
+
+# =========================
+# Cache CSV (conteos)
 # =========================
 _cache_counts: Dict[str, int] = {}
 _cache_last_fetch: float = 0.0
-
-def normalize(s: str) -> str:
-    return (s or "").strip().lower()
 
 async def fetch_counts_from_sheets() -> Dict[str, int]:
     if not SHEETS_CSV_URL:
@@ -124,36 +177,13 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
             _cache_last_fetch = now
     return _cache_counts
 
-# =========================
-# Fuzzy matching (sugerencia)
-# =========================
-def _levenshtein(a: str, b: str) -> int:
-    a, b = a.lower(), b.lower()
-    if a == b: return 0
-    if not a: return len(b)
-    if not b: return len(a)
-    prev = list(range(len(b)+1))
-    for i, ca in enumerate(a, 1):
-        curr = [i]
-        for j, cb in enumerate(b, 1):
-            curr.append(min(prev[j]+1, curr[j-1]+1, prev[j-1] + (ca != cb)))
-        prev = curr
-    return prev[-1]
-
-def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
-    """Devuelve (exacto, sugerido). Exacto = nombre oficial exacto; sugerido = mejor match si dist<=max_dist."""
-    t = (user_text or "").strip().lower()
-    # exacto
-    for m in MUNICIPIOS_OFICIALES:
-        if t == m.lower():
-            return m, None
-    # sugerencia
-    mejor, dist = None, 999
-    for m in MUNICIPIOS_OFICIALES:
-        d = _levenshtein(t, m)
-        if d < dist:
-            mejor, dist = m, d
-    return (None, mejor) if (mejor and dist <= max_dist) else (None, None)
+def get_count_for(oficial_name: str, counts: Dict[str, int]) -> int:
+    # Busca por nombre normalizado; si no está, regresa 0
+    n_of = normalize(oficial_name)
+    for k, v in counts.items():
+        if normalize(k) == n_of:
+            return v
+    return 0
 
 # =========================
 # Telegram helpers
@@ -191,7 +221,11 @@ async def send_message(chat_id: int, text: str,
 # =========================
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Servicio del Chatbot PED en línea 🚀", "endpoints": ["/healthz", "/set-webhook", "/delete-webhook", "/webhook"]}
+    return {
+        "status": "ok",
+        "message": "Servicio del Chatbot PED en línea 🚀",
+        "endpoints": ["/healthz", "/webhook", "/set-webhook", "/delete-webhook"]
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -232,27 +266,29 @@ async def telegram_webhook(
         if data.startswith("consultar:") and chat_id:
             muni = data.split(":", 1)[1]
             counts = await get_counts_cached()
-            n = 0
-            for k, v in counts.items():
-                if normalize(k) == normalize(muni):
-                    n = v
-                    break
+            n = get_count_for(muni, counts)
             await answer_cb()
-            await send_message(chat_id, f"🔄 Consulta actualizada para *{muni}*:\n\nActualmente lleva {n} registro(s).",
-                               reply_markup=inline_consultar_de_nuevo(muni))
+            await send_message(
+                chat_id,
+                f"🔄 Consulta actualizada para *{muni}*:\n\nActualmente lleva {n} registro(s).",
+                reply_markup=inline_consultar_de_nuevo(muni)
+            )
             return {"ok": True}
 
         if data == "invalid_reset" and chat_id:
             reset_user_municipio(str(chat_id))
             await answer_cb()
-            await send_message(chat_id, "🧹 Listo. Vuelve a escribir tu municipio.\n\nEjemplo: *municipio Pachuca de Soto*",
-                               reply_markup=reply_keyboard())
+            await send_message(
+                chat_id,
+                "🧹 Listo. Vuelve a escribir tu municipio.\n\nEjemplo: *municipio San Felipe Orizatlán*",
+                reply_markup=reply_keyboard()
+            )
             return {"ok": True}
 
         await answer_cb()
         return {"ok": True}
 
-    # Mensajes de texto
+    # Mensajes
     message = update.get("message") or {}
     text = message.get("text", "")
     chat = message.get("chat") or {}
@@ -267,22 +303,26 @@ async def telegram_webhook(
     if t.startswith("/start"):
         counts = await get_counts_cached()
         total = sum(counts.values()) if counts else 0
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             "¡Hola! 👋\n"
             "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
-            "📍 Escríbeme: *municipio Pachuca de Soto* (por ejemplo) para ver su conteo.\n\n"
+            "📍 Escríbeme: *municipio San Felipe Orizatlán* (por ejemplo) para ver su conteo.\n\n"
             f"📊 **Registros totales a nivel estatal: {total}**",
-            reply_markup=reply_keyboard())
+            reply_markup=reply_keyboard()
+        )
         return {"ok": True}
 
     if t.startswith("/ayuda"):
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             "🧭 *Menú de ayuda*\n\n"
             "• Para consultar escribe: *municipio Pachuca de Soto* (cámbialo por tu municipio).\n"
             "• Para refrescar los datos: */refrescar*\n"
             "• Para ver tu ID: */id*\n\n"
-            "📌 Nota: el nombre se valida contra el *listado oficial de 84 municipios*. Si hay un error de ortografía te sugeriré el nombre correcto.",
-            reply_markup=reply_keyboard())
+            "📌 Nota: el nombre se valida contra el *listado oficial de 84 municipios*, aceptando también sin acentos.",
+            reply_markup=reply_keyboard()
+        )
         return {"ok": True}
 
     if t.startswith("/refrescar"):
@@ -309,45 +349,52 @@ async def telegram_webhook(
         exacto, sugerido = validar_municipio(nombre)
 
         if not exacto and not sugerido:
-            await send_message(chat_id,
+            await send_message(
+                chat_id,
                 f"⚠️ No encontré *{nombre}* en la lista oficial de municipios.\n\n"
                 "Verifica la ortografía o corrígelo.",
-                reply_markup=inline_only_corregir())
+                reply_markup=inline_only_corregir()
+            )
             return {"ok": True}
 
         if sugerido and not exacto:
-            await send_message(chat_id,
+            await send_message(
+                chat_id,
                 f"⚠️ No encontré *{nombre}* en la lista oficial.\n\n"
                 f"¿Quisiste decir *{sugerido}*?\n\n"
                 "Si fue un error, corrígelo:",
-                reply_markup=inline_only_corregir())
+                reply_markup=inline_only_corregir()
+            )
             return {"ok": True}
 
         oficial = exacto or sugerido
-        # Conteo desde CSV (0 si no está)
         counts = await get_counts_cached()
-        n = 0
-        for k, v in counts.items():
-            if normalize(k) == normalize(oficial):
-                n = v
-                break
+        n = get_count_for(oficial, counts)  # 0 si no está en CSV
 
         set_user_municipio(str(chat_id), oficial)
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             f"✅ Registré *{oficial}* para este chat.\n\nActualmente lleva {n} registro(s).",
-            reply_markup=inline_consultar_de_nuevo(oficial))
+            reply_markup=inline_consultar_de_nuevo(oficial)
+        )
         return {"ok": True}
 
-    # Despedidas tiernas
+    # Despedidas
     if any(w in t for w in ("gracias", "adios", "adiós", "bye", "hasta luego", "nos vemos")):
-        await send_message(chat_id,
+        await send_message(
+            chat_id,
             "🙏 *Gracias por tu colaboración y esfuerzo.*\n\n"
             "Tu participación fortalece la actualización del Plan Estatal de Desarrollo 2025-2028.",
-            reply_markup=reply_keyboard())
+            reply_markup=reply_keyboard()
+        )
         return {"ok": True}
 
     # Fallback
-    await send_message(chat_id, "🤔 No entendí. Escribe *municipio Pachuca de Soto* o */ayuda*.", reply_markup=reply_keyboard())
+    await send_message(
+        chat_id,
+        "🤔 No entendí. Escribe *municipio San Felipe Orizatlán* o */ayuda*.",
+        reply_markup=reply_keyboard()
+    )
     return {"ok": True}
 
 # =========================
