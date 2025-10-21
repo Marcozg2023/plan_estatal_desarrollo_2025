@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os, re, time, csv, io, sqlite3
-from typing import Dict, Any, Optional
+import os, re, time, csv, io, sqlite3, math
+from typing import Dict, Any, Optional, List
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException, Query
@@ -12,16 +12,17 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")  # URL pública completa a /webhook
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # tu chat_id para /reset
 
 # Google Sheets (CSV publicado)
-SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()  # pub?output=csv&gid=... o export?format=csv&gid=...
+SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()
 SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip()
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.5")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.7")
 
 # ========= DB (SQLite) =========
 def db():
@@ -76,33 +77,24 @@ def normalize(s: str) -> str:
     return (s or "").strip().lower()
 
 async def fetch_counts_from_sheets() -> Dict[str, int]:
-    """
-    Descarga el CSV del Sheet con follow_redirects=True (tolera 307/308).
-    No usamos raise_for_status; si no es 200 devolvemos {} y registramos.
-    """
+    """Descarga CSV con redirects permitidos y sin raise_for_status."""
     if not SHEETS_CSV_URL:
         return {}
     try:
         async with httpx.AsyncClient(
-            timeout=60,
-            follow_redirects=True,
+            timeout=60, follow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0"}
         ) as client:
             r = await client.get(SHEETS_CSV_URL)
-
         if r.status_code != 200:
             print(f"[sheets] non-200 status={r.status_code} url={r.url}")
             return {}
-
         content = r.content.decode("utf-8", errors="replace")
-
     except Exception as e:
         print(f"[sheets] exception: {e}")
         return {}
 
     reader = csv.DictReader(io.StringIO(content))
-
-    # detectar columna de municipio (tolerante)
     headers_map = {(h or "").lower().strip(): (h or "") for h in (reader.fieldnames or [])}
     field_actual = headers_map.get(SHEETS_FIELD_MUNICIPIO.lower())
     if not field_actual:
@@ -127,7 +119,7 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
     now = time.time()
     if force or (now - _cache_last_fetch > SHEETS_CACHE_TTL) or not _cache_counts:
         data = await fetch_counts_from_sheets()
-        if data:   # solo pisa cache si la lectura fue exitosa
+        if data:
             _cache_counts = data
             _cache_last_fetch = now
         else:
@@ -137,23 +129,20 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
 async def get_municipio_count(nombre: str) -> int:
     counts = await get_counts_cached()
     tgt = normalize(nombre)
-    # exacto
     for k, v in counts.items():
         if normalize(k) == tgt:
             return v
-    # aproximado
     for k, v in counts.items():
         if tgt and tgt in normalize(k):
             return v
     return 0
 
-# ========= Telegram: keyboards & helpers =========
-def menu_keyboard(default_muni_example: str = "Pachuca") -> Dict[str, Any]:
-    """Reply keyboard persistente con accesos rápidos."""
+# ========= Telegram: teclados & helpers =========
+def menu_keyboard() -> Dict[str, Any]:
+    """Reply keyboard persistente (SIN municipio ejemplo NI /reset)."""
     return {
         "keyboard": [
             [{"text": "/ayuda"}, {"text": "/refrescar"}],
-            [{"text": f"municipio {default_muni_example}"}, {"text": "/reset"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -164,21 +153,59 @@ def remove_keyboard() -> Dict[str, Any]:
     return {"remove_keyboard": True}
 
 def inline_consultar_de_nuevo(municipio: str) -> Dict[str, Any]:
-    """Inline keyboard con botón para re-consultar el municipio."""
     return {
-        "inline_keyboard": [
-            [
-                {"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{municipio}"}
-            ]
-        ]
+        "inline_keyboard": [[
+            {"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{municipio}"}
+        ]]
     }
 
-async def send_message(
-    chat_id: int,
-    text: str,
-    parse_mode: Optional[str] = None,
-    reply_markup: Optional[Dict[str, Any]] = None
-):
+def chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
+
+def municipios_keyboard(page: int, per_page: int = 24) -> Dict[str, Any]:
+    """
+    Crea un reply keyboard con botones 'municipio <Nombre>' a partir del CSV.
+    Muestra 'per_page' municipios por página (2 por fila).
+    Agrega navegación con /municipios <n>.
+    """
+    # ordenar alfabéticamente (títulos originales)
+    nombres = sorted(list(_cache_counts.keys())) if _cache_counts else []
+    total = len(nombres)
+    if total == 0:
+        return menu_keyboard()
+
+    # paginación
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * per_page
+    end = start + per_page
+    subset = nombres[start:end]
+
+    # filas de 2 botones
+    rows = []
+    for row in chunk(subset, 2):
+        rows.append([{"text": f"municipio {name}"} for name in row])
+
+    # fila de navegación
+    nav_row = []
+    if page > 1:
+        nav_row.append({"text": f"/municipios {page-1}"})
+    nav_row.append({"text": "/ayuda"})
+    nav_row.append({"text": "/refrescar"})
+    if page < total_pages:
+        nav_row.append({"text": f"/municipios {page+1}"})
+    rows.append(nav_row)
+
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True
+    }
+
+async def send_message(chat_id: int, text: str,
+                       parse_mode: Optional[str] = None,
+                       reply_markup: Optional[Dict[str, Any]] = None):
     if not API_URL:
         return
     payload = {"chat_id": chat_id, "text": text}
@@ -195,7 +222,6 @@ async def send_message(
         print(f"[send_message] exception: {e}")
 
 async def answer_callback(callback_id: str, text: Optional[str] = None, show_alert: bool = False):
-    """Responde al callback para quitar el spinner en el botón inline."""
     if not API_URL or not callback_id:
         return
     payload = {"callback_query_id": callback_id}
@@ -210,33 +236,22 @@ async def answer_callback(callback_id: str, text: Optional[str] = None, show_ale
 
 def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
-
-    # comandos primero
     if t.startswith("/start"): return "start"
     if (
         t.startswith("/ayuda") or t == "ayuda" or t == "/help" or
         t == "menu" or t == "menú" or "menu de ayuda" in t or "menú de ayuda" in t or
         t == "opciones" or "qué puedo hacer" in t or "que puedo hacer" in t
-    ):
-        return "ayuda"
+    ): return "ayuda"
+    if t.startswith("/municipios") or t == "municipios": return "municipios"
     if t.startswith("/info") or "plan estatal" in t or "ped" in t: return "info"
-    if t.startswith("/reset"): return "reset"
+    if t.startswith("/reset"): return "reset"  # solo admin
     if t.startswith("/refrescar"): return "refrescar"
     if t.startswith("/id"): return "id"
     if t.startswith("/ocultar"): return "ocultar"
-
-    # despedidas
     if any(w in t for w in ("gracias", "adios", "adiós", "bye", "nos vemos", "hasta luego")):
         return "despedida"
-
-    # solo "municipio" si inicia con esa palabra
-    if re.match(r"^\s*municipio(\s|:)", t):
-        return "municipio"
-
-    # saludos
-    if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")):
-        return "saludo"
-
+    if re.match(r"^\s*municipio(\s|:)", t): return "municipio"
+    if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")): return "saludo"
     return "fallback"
 
 def extract_municipio(text: str) -> Optional[str]:
@@ -245,7 +260,25 @@ def extract_municipio(text: str) -> Optional[str]:
     if m: return m.group(1).strip()
     return text.strip()
 
+def extract_page(text: str) -> int:
+    """Lee /municipios <n> (por defecto 1)."""
+    m = re.search(r"/municipios\s+(\d+)", (text or "").strip(), flags=re.I)
+    if m:
+        try:
+            return max(1, int(m.group(1)))
+        except ValueError:
+            return 1
+    return 1
+
 # ========= Endpoints =========
+@app.get("/")
+async def home():
+    return {
+        "status": "ok",
+        "message": "Servicio del Chatbot PED en línea 🚀",
+        "endpoints": ["/healthz", "/webhook", "/set-webhook", "/delete-webhook"]
+    }
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -273,7 +306,7 @@ async def telegram_webhook(
             if data.startswith("consultar:") and chat_id:
                 muni = data.split(":", 1)[1]
                 n = await get_municipio_count(muni)
-                await answer_callback(callback_id)  # quita spinner
+                await answer_callback(callback_id)
                 await send_message(
                     chat_id,
                     f"🔄 Consulta actualizada para *{muni}*:\n\nActualmente lleva {n} registro(s).",
@@ -302,38 +335,52 @@ async def telegram_webhook(
                 chat_id,
                 "¡Hola! 👋\n"
                 "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
-                "📍 Escríbeme: *municipio Pachuca* (por ejemplo) para ver su conteo.\n\n"
+                "📍 Escríbeme: *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
+                "También puedes usar */municipios* para ver botones rápidos por nombre.\n\n"
                 f"📊 **Registros totales a nivel estatal: {total}**",
                 parse_mode="Markdown",
                 reply_markup=menu_keyboard()
             )
             return {"ok": True}
 
-        # /ayuda, menu/menú, opciones, qué puedo hacer
+        # /ayuda (sin /reset), referencia /municipios
         if intent == "ayuda":
             ayuda_text = (
                 "🧭 *Menú de ayuda*\n\n"
                 "¿Qué puedes hacer aquí?\n\n"
                 "1) 👀 Consultar el conteo de tu municipio\n"
                 "   Escribe: *municipio Pachuca*\n"
-                "   (Cámbialo por el nombre que te interese)\n\n"
+                "   (o usa */municipios* para ver botones rápidos)\n\n"
                 "2) 📊 Ver el total estatal actualizado\n"
                 "   Escribe: */start*\n\n"
                 "3) 🔄 Actualizar los datos (si cambió la base)\n"
                 "   Escribe: */refrescar*\n\n"
                 "4) 🆔 Ver tu ID de chat (por soporte)\n"
                 "   Escribe: */id*\n\n"
-                "5) 🔁 Cambiar el municipio registrado en este chat\n"
-                "   Escribe: */reset* y luego: *municipio [Nombre]*\n\n"
-                "6) 🆘 Volver a este menú\n"
+                "5) 🆘 Volver a este menú\n"
                 "   Escribe: */ayuda*\n\n"
                 "—\n"
                 "📌 *Notas importantes*\n"
-                "• Solo se registra *un municipio por chat*. Si quieres cambiarlo, usa */reset*.\n"
+                "• Solo se registra *un municipio por chat*. Si necesitas cambiarlo, contacta a un *administrador*.\n"
                 "• Los datos se leen de una hoja pública de Google Sheets y se *actualizan cada 1–2 minutos*.\n"
                 "• No solicitamos datos personales. Tu participación ayuda a fortalecer la planeación del estado."
             )
             await send_message(chat_id, ayuda_text, parse_mode="Markdown", reply_markup=menu_keyboard())
+            return {"ok": True}
+
+        # /municipios [página]
+        if intent == "municipios":
+            # aseguramos cache al día
+            await get_counts_cached()
+            page = extract_page(text or "")
+            kb = municipios_keyboard(page=page, per_page=24)
+            total = len(_cache_counts)
+            await send_message(
+                chat_id,
+                f"📚 Municipios disponibles (página {page}). Total: {total}.\n"
+                "Toca un botón para consultar. Usa /municipios <n> para cambiar de página.",
+                reply_markup=kb
+            )
             return {"ok": True}
 
         # /info
@@ -356,18 +403,21 @@ async def telegram_webhook(
             await send_message(chat_id, f"🆔 Tu chat_id es: {chat_id}", reply_markup=menu_keyboard())
             return {"ok": True}
 
-        # /reset
-        if intent == "reset":
-            removed = reset_user_municipio(str(chat_id))
-            if removed:
-                await send_message(chat_id, "✅ Municipio restablecido. Ahora envía: municipio Pachuca", reply_markup=menu_keyboard())
-            else:
-                await send_message(chat_id, "No tenías municipio registrado. Envía: municipio Pachuca", reply_markup=menu_keyboard())
-            return {"ok": True}
-
-        # /ocultar (remueve el teclado)
+        # /ocultar (remueve el teclado base)
         if intent == "ocultar":
             await send_message(chat_id, "Teclado ocultado. Para mostrarlo otra vez envía /ayuda o /start.", reply_markup=remove_keyboard())
+            return {"ok": True}
+
+        # /reset (SOLO ADMIN)
+        if intent == "reset":
+            if ADMIN_CHAT_ID == 0 or chat_id != ADMIN_CHAT_ID:
+                await send_message(chat_id, "⚠️ Este comando solo está disponible para administradores.")
+                return {"ok": True}
+            removed = reset_user_municipio(str(chat_id))
+            if removed:
+                await send_message(chat_id, "✅ Municipio restablecido.")
+            else:
+                await send_message(chat_id, "No tenías municipio registrado.")
             return {"ok": True}
 
         # despedida
@@ -395,7 +445,7 @@ async def telegram_webhook(
                 await send_message(
                     chat_id,
                     f"📍 Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n\n"
-                    "Si crees que es un error, usa /reset.",
+                    "Si necesitas cambiarlo, por favor contacta a un *administrador*.",
                     parse_mode="Markdown",
                     reply_markup=inline_consultar_de_nuevo(ya_registrado)
                 )
@@ -424,11 +474,11 @@ async def telegram_webhook(
             return {"ok": True}
 
         # fallback
-        await send_message(chat_id, "🤔 No entendí tu mensaje. Escribe /ayuda para ver opciones.", reply_markup=menu_keyboard())
+        await send_message(chat_id, "🤔 No entendí tu mensaje. Escribe /ayuda o usa /municipios.", reply_markup=menu_keyboard())
         return {"ok": True}
 
     except Exception as e:
-        print(f"[webhook] error: {e}")  # Loguea, pero no rompas
+        print(f"[webhook] error: {e}")
         return {"ok": True}
 
 # ========= Utilidades set/delete webhook =========
@@ -449,7 +499,6 @@ async def _tg_delete_webhook() -> Dict[str, Any]:
         r = await client.post(f"{API_URL}/deleteWebhook")
         return r.json()
 
-# Aceptar GET y POST para poder usar navegador o POSTman
 @app.api_route("/set-webhook", methods=["GET", "POST"])
 async def set_webhook():
     if not WEBHOOK_URL:
