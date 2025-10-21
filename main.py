@@ -21,7 +21,7 @@ SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.4")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.3.5")
 
 # ========= DB (SQLite) =========
 def db():
@@ -147,23 +147,38 @@ async def get_municipio_count(nombre: str) -> int:
             return v
     return 0
 
-# ========= Telegram: helpers =========
+# ========= Telegram: keyboards & helpers =========
 def menu_keyboard(default_muni_example: str = "Pachuca") -> Dict[str, Any]:
-    """Teclado rápido persistente."""
+    """Reply keyboard persistente con accesos rápidos."""
     return {
         "keyboard": [
             [{"text": "/ayuda"}, {"text": "/refrescar"}],
             [{"text": f"municipio {default_muni_example}"}, {"text": "/reset"}],
         ],
         "resize_keyboard": True,
-        "one_time_keyboard": False,   # se mantiene visible
+        "one_time_keyboard": False,
         "is_persistent": True
     }
 
 def remove_keyboard() -> Dict[str, Any]:
     return {"remove_keyboard": True}
 
-async def send_message(chat_id: int, text: str, parse_mode: Optional[str] = None, reply_markup: Optional[Dict[str, Any]] = None):
+def inline_consultar_de_nuevo(municipio: str) -> Dict[str, Any]:
+    """Inline keyboard con botón para re-consultar el municipio."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{municipio}"}
+            ]
+        ]
+    }
+
+async def send_message(
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[Dict[str, Any]] = None
+):
     if not API_URL:
         return
     payload = {"chat_id": chat_id, "text": text}
@@ -178,6 +193,20 @@ async def send_message(chat_id: int, text: str, parse_mode: Optional[str] = None
                 print(f"[send_message] status={r.status_code} body={r.text[:300]}")
     except Exception as e:
         print(f"[send_message] exception: {e}")
+
+async def answer_callback(callback_id: str, text: Optional[str] = None, show_alert: bool = False):
+    """Responde al callback para quitar el spinner en el botón inline."""
+    if not API_URL or not callback_id:
+        return
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = show_alert
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(f"{API_URL}/answerCallbackQuery", json=payload)
+    except Exception as e:
+        print(f"[answer_callback] exception: {e}")
 
 def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
@@ -233,6 +262,29 @@ async def telegram_webhook(
 
     try:
         update = await request.json()
+
+        # --- Callback queries (inline buttons) ---
+        callback = update.get("callback_query")
+        if callback:
+            callback_id = callback.get("id")
+            data = callback.get("data") or ""
+            chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id")
+
+            if data.startswith("consultar:") and chat_id:
+                muni = data.split(":", 1)[1]
+                n = await get_municipio_count(muni)
+                await answer_callback(callback_id)  # quita spinner
+                await send_message(
+                    chat_id,
+                    f"🔄 Consulta actualizada para *{muni}*:\n\nActualmente lleva {n} registro(s).",
+                    parse_mode="Markdown",
+                    reply_markup=inline_consultar_de_nuevo(muni)
+                )
+            else:
+                await answer_callback(callback_id)
+            return {"ok": True}
+
+        # --- Mensajes normales ---
         message = update.get("message") or {}
         text = message.get("text")
         chat = message.get("chat") or {}
@@ -286,7 +338,11 @@ async def telegram_webhook(
 
         # /info
         if intent == "info":
-            await send_message(chat_id, "ℹ️ Consulto el conteo por municipio desde una hoja de Google Sheets publicada.", reply_markup=menu_keyboard())
+            await send_message(
+                chat_id,
+                "ℹ️ Consulto el conteo por municipio desde una hoja de Google Sheets publicada.",
+                reply_markup=menu_keyboard()
+            )
             return {"ok": True}
 
         # /refrescar
@@ -341,7 +397,7 @@ async def telegram_webhook(
                     f"📍 Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n\n"
                     "Si crees que es un error, usa /reset.",
                     parse_mode="Markdown",
-                    reply_markup=menu_keyboard(ya_registrado)
+                    reply_markup=inline_consultar_de_nuevo(ya_registrado)
                 )
                 return {"ok": True}
 
@@ -363,7 +419,7 @@ async def telegram_webhook(
                 chat_id,
                 f"✅ Registré *{elegido}* para este chat.\n\nActualmente lleva {n} registro(s).",
                 parse_mode="Markdown",
-                reply_markup=menu_keyboard(elegido)
+                reply_markup=inline_consultar_de_nuevo(elegido)
             )
             return {"ok": True}
 
