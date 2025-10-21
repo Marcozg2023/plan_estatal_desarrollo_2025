@@ -251,15 +251,18 @@ async def telegram_webhook(
         intent = detect_intent(text or "")
 
         if intent == "start":
-            counts = await get_counts_cached()
-            total = sum(counts.values()) if counts else 0
-            await send_message(
-                chat_id,
-                "¡Hola! Soy tu asistente para la actualización del Plan Estatal de Desarrollo 2025-2028.\n"
-                "Escríbeme *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
-                f"Registros totales a nivel estatal: {total}"
-            )
-            return {"ok": True}
+    counts = await get_counts_cached()
+    total = sum(counts.values()) if counts else 0
+    await send_message(
+        chat_id,
+        "¡Hola! 👋\n"
+        "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
+        "📍 Escríbeme: *municipio Pachuca* (por ejemplo) para ver su conteo.\n\n"
+        f"📊 **Registros totales a nivel estatal: {total}**",
+        parse_mode="Markdown"
+    )
+    return {"ok": True}
+
 
         if intent == "ayuda":
             await send_message(
