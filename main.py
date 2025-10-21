@@ -21,7 +21,9 @@ SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip(
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED Hidalgo", version="2.4")
+ALLOW_SELF_RESET = os.getenv("ALLOW_SELF_RESET", "false").strip().lower() in ("1","true","yes","y")
+
+app = FastAPI(title="Chatbot PED Hidalgo", version="2.5")
 
 # =========================
 # Listado oficial (84 municipios, sin números)
@@ -70,6 +72,14 @@ def init_db():
 
 init_db()
 
+def get_user_municipio(chat_id: str) -> Optional[str]:
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT municipio FROM user_municipio WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    conn.close()
+    return row["municipio"] if row else None
+
 def set_user_municipio(chat_id: str, municipio: str) -> None:
     conn = db()
     c = conn.cursor()
@@ -87,26 +97,14 @@ def reset_user_municipio(chat_id: str) -> int:
     return n
 
 # =========================
-# Utilidades de normalización y fuzzy
+# Normalización y fuzzy
 # =========================
 def strip_accents(s: str) -> str:
-    # Elimina diacríticos (tildes/ñ/ü) para comparar sin acentos
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-    )
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
 def normalize(s: str) -> str:
-    """
-    Normaliza para comparación:
-    - quita espacios extra
-    - pasa a minúsculas
-    - elimina acentos
-    """
-    if not s:
-        return ""
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
+    if not s: return ""
+    s = re.sub(r"\s+", " ", s.strip())
     s = strip_accents(s).lower()
     return s
 
@@ -124,11 +122,6 @@ def levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Devuelve (exacto, sugerido).
-    - exacto: nombre oficial si coincide exactamente (ignorando acentos/mayúsculas/espacios múltiples).
-    - sugerido: mejor match por distancia Levenshtein si dist <= max_dist.
-    """
     t = normalize(user_text)
     # exacto
     for m in MUNICIPIOS_OFICIALES:
@@ -178,7 +171,6 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
     return _cache_counts
 
 def get_count_for(oficial_name: str, counts: Dict[str, int]) -> int:
-    # Busca por nombre normalizado; si no está, regresa 0
     n_of = normalize(oficial_name)
     for k, v in counts.items():
         if normalize(k) == n_of:
@@ -199,8 +191,15 @@ def reply_keyboard() -> Dict[str, Any]:
 def inline_consultar_de_nuevo(muni: str) -> Dict[str, Any]:
     return {"inline_keyboard": [[{"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{muni}"}]]}
 
+def inline_cambiar_municipio() -> Dict[str, Any]:
+    # Solo mostrar si ALLOW_SELF_RESET está activo
+    if not ALLOW_SELF_RESET:
+        return {}
+    return {"inline_keyboard": [[{"text": "🧹 Cambiar municipio", "callback_data": "self_reset"}]]}
+
 def inline_only_corregir() -> Dict[str, Any]:
-    return {"inline_keyboard": [[{"text": "🧹 Corregir municipio", "callback_data": "invalid_reset"}]]}
+    # Botón de corrección solo si se permite auto-reset
+    return inline_cambiar_municipio()
 
 async def send_message(chat_id: int, text: str,
                        parse_mode: Optional[str] = "Markdown",
@@ -239,7 +238,6 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
-    # valida secret (si se configuró)
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
         return JSONResponse({"ok": True})
 
@@ -275,12 +273,12 @@ async def telegram_webhook(
             )
             return {"ok": True}
 
-        if data == "invalid_reset" and chat_id:
+        if data == "self_reset" and chat_id and ALLOW_SELF_RESET:
             reset_user_municipio(str(chat_id))
             await answer_cb()
             await send_message(
                 chat_id,
-                "🧹 Listo. Vuelve a escribir tu municipio.\n\nEjemplo: *municipio San Felipe Orizatlán*",
+                "🧹 Listo. Ahora puedes volver a escribir tu municipio.\n\nEjemplo: *municipio Pachuca de Soto*",
                 reply_markup=reply_keyboard()
             )
             return {"ok": True}
@@ -307,20 +305,21 @@ async def telegram_webhook(
             chat_id,
             "¡Hola! 👋\n"
             "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
-            "📍 Escríbeme: *municipio San Felipe Orizatlán* (por ejemplo) para ver su conteo.\n\n"
+            "📍 Escríbeme: *municipio Pachuca de Soto* (por ejemplo) para ver su conteo.\n\n"
             f"📊 **Registros totales a nivel estatal: {total}**",
             reply_markup=reply_keyboard()
         )
         return {"ok": True}
 
     if t.startswith("/ayuda"):
+        nota_cambio = "Para cambiarlo, contacta a un *administrador*." if not ALLOW_SELF_RESET else "Para cambiarlo, toca *🧹 Cambiar municipio* cuando el bot te lo ofrezca."
         await send_message(
             chat_id,
             "🧭 *Menú de ayuda*\n\n"
             "• Para consultar escribe: *municipio Pachuca de Soto* (cámbialo por tu municipio).\n"
             "• Para refrescar los datos: */refrescar*\n"
             "• Para ver tu ID: */id*\n\n"
-            "📌 Nota: el nombre se valida contra el *listado oficial de 84 municipios*, aceptando también sin acentos.",
+            "📌 Nota: solo se permite *un municipio por chat*. " + nota_cambio,
             reply_markup=reply_keyboard()
         )
         return {"ok": True}
@@ -348,12 +347,26 @@ async def telegram_webhook(
         nombre = text.split(" ", 1)[1] if " " in text else ""
         exacto, sugerido = validar_municipio(nombre)
 
+        # Si ya hay municipio registrado, NO permitir cambiar por aquí
+        ya_reg = get_user_municipio(str(chat_id))
+        if ya_reg:
+            counts = await get_counts_cached()
+            n = get_count_for(ya_reg, counts)
+            extra = "" if not ALLOW_SELF_RESET else "\n\nSi necesitas cambiarlo, toca *🧹 Cambiar municipio*."
+            await send_message(
+                chat_id,
+                f"📍 Ya tienes registrado: *{ya_reg}*.\nActualmente lleva {n} registro(s)." + extra,
+                reply_markup=inline_cambiar_municipio() if ALLOW_SELF_RESET else None
+            )
+            return {"ok": True}
+
+        # Si no hay registro previo, proceder a validar y registrar
         if not exacto and not sugerido:
+            # Nombre inválido: solo advertimos (sin auto-reset)
             await send_message(
                 chat_id,
                 f"⚠️ No encontré *{nombre}* en la lista oficial de municipios.\n\n"
-                "Verifica la ortografía o corrígelo.",
-                reply_markup=inline_only_corregir()
+                "Verifica la ortografía e inténtalo de nuevo."
             )
             return {"ok": True}
 
@@ -362,8 +375,7 @@ async def telegram_webhook(
                 chat_id,
                 f"⚠️ No encontré *{nombre}* en la lista oficial.\n\n"
                 f"¿Quisiste decir *{sugerido}*?\n\n"
-                "Si fue un error, corrígelo:",
-                reply_markup=inline_only_corregir()
+                "Vuelve a enviarlo con el formato: *municipio Sugerido*."
             )
             return {"ok": True}
 
@@ -392,7 +404,7 @@ async def telegram_webhook(
     # Fallback
     await send_message(
         chat_id,
-        "🤔 No entendí. Escribe *municipio San Felipe Orizatlán* o */ayuda*.",
+        "🤔 No entendí. Escribe *municipio Pachuca de Soto* o */ayuda*.",
         reply_markup=reply_keyboard()
     )
     return {"ok": True}
