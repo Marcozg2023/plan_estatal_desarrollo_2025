@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os, re, time, csv, io, sqlite3
 from typing import Dict, Any, Optional
+
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 # ========= Variables de entorno =========
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -12,14 +14,14 @@ WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "")
 
 # Google Sheets (CSV publicado)
-SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "")  # pub?output=csv&gid=...
-SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio")
+SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()  # pub?output=csv&gid=... o export?format=csv&gid=...
+SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip()
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 
 # Base de datos local
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.2.1")
+app = FastAPI(title="Chatbot PED (1 municipio por persona)", version="1.2.2")
 
 # ========= DB (SQLite) =========
 def db():
@@ -74,16 +76,34 @@ def normalize(s: str) -> str:
     return (s or "").strip().lower()
 
 async def fetch_counts_from_sheets() -> Dict[str, int]:
+    """
+    Descarga el CSV del Sheet con follow_redirects=True para tolerar 307/308.
+    NO usamos raise_for_status para no romper el webhook; en su lugar devolvemos {} y logeamos.
+    """
     if not SHEETS_CSV_URL:
         return {}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(SHEETS_CSV_URL)
-        r.raise_for_status()
+    try:
+        async with httpx.AsyncClient(
+            timeout=60,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"}  # ayuda con endpoints de Google
+        ) as client:
+            r = await client.get(SHEETS_CSV_URL)
+
+        if r.status_code != 200:
+            print(f"[sheets] non-200 status={r.status_code} url={r.url}")
+            return {}
+
         content = r.content.decode("utf-8", errors="replace")
+
+    except Exception as e:
+        print(f"[sheets] exception: {e}")
+        return {}
+
     reader = csv.DictReader(io.StringIO(content))
 
-    # detectar columna de municipio (tolerante)
-    headers_map = {h.lower().strip(): h for h in (reader.fieldnames or [])}
+    # detectar columna de municipio (tolerante a mayúsculas/variantes)
+    headers_map = { (h or "").lower().strip(): (h or "") for h in (reader.fieldnames or []) }
     field_actual = headers_map.get(SHEETS_FIELD_MUNICIPIO.lower())
     if not field_actual:
         for k, v in headers_map.items():
@@ -91,6 +111,7 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
                 field_actual = v
                 break
     if not field_actual:
+        print(f"[sheets] columna '{SHEETS_FIELD_MUNICIPIO}' no encontrada. Headers: {reader.fieldnames}")
         return {}
 
     counts: Dict[str, int] = {}
@@ -105,8 +126,12 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
     global _cache_counts, _cache_last_fetch
     now = time.time()
     if force or (now - _cache_last_fetch > SHEETS_CACHE_TTL) or not _cache_counts:
-        _cache_counts = await fetch_counts_from_sheets()
-        _cache_last_fetch = now
+        data = await fetch_counts_from_sheets()
+        if data:   # solo pisa cache si la lectura fue exitosa
+            _cache_counts = data
+            _cache_last_fetch = now
+        else:
+            print("[cache] usando último cache válido (si existe)")
     return _cache_counts
 
 async def get_municipio_count(nombre: str) -> int:
@@ -116,7 +141,7 @@ async def get_municipio_count(nombre: str) -> int:
     for k, v in counts.items():
         if normalize(k) == tgt:
             return v
-    # aproximado: "pachuca" en "pachuca de soto"
+    # aproximado
     for k, v in counts.items():
         if tgt and tgt in normalize(k):
             return v
@@ -126,14 +151,19 @@ async def get_municipio_count(nombre: str) -> int:
 async def send_message(chat_id: int, text: str):
     if not API_URL:
         return
-    async with httpx.AsyncClient(timeout=20) as client:
-        await client.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+            if r.status_code != 200:
+                print(f"[send_message] status={r.status_code} body={r.text[:300]}")
+    except Exception as e:
+        print(f"[send_message] exception: {e}")
 
 def detect_intent(text: str) -> str:
     t = (text or "").strip().lower()
     if any(w in t for w in ("hola", "buenos días", "buenas", "saludos")): return "saludo"
     if "ayuda" in t or "help" in t or "comandos" in t: return "ayuda"
-    if "info" in t or "plan estatal" in t or "ped" in t: return "info"   # ← corregido
+    if "info" in t or "plan estatal" in t or "ped" in t: return "info"
     if t.startswith("municipio ") or t.startswith("municipio:") or len(t.split()) <= 4: return "municipio"
     return "fallback"
 
@@ -153,7 +183,12 @@ async def home():
         "field_municipio": SHEETS_FIELD_MUNICIPIO,
         "cache_ttl": SHEETS_CACHE_TTL,
         "db": os.path.abspath(DB_PATH),
+        "cache_age_sec": (time.time() - _cache_last_fetch) if _cache_last_fetch else None,
     }
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 # Admin: forzar refresco del CSV
 @app.post("/refresh-sheets")
@@ -179,78 +214,86 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
+    # Si configuraste secret, valida. Si es inválido, no rompas el endpoint.
     if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+        print("[webhook] invalid secret token")
+        return JSONResponse({"ok": True})
 
-    update = await request.json()
-    message = update.get("message") or {}
-    text = message.get("text")
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    if not chat_id:
-        return {"ok": True}
-
-    intent = detect_intent(text or "")
-
-    if intent == "saludo":
-        await send_message(
-            chat_id,
-            "¡Hola! Soy tu asistente del Plan Estatal de Desarrollo.\n"
-            "Escribe *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
-            "Nota: Solo puedes registrar *un municipio* por chat."
-        )
-        return {"ok": True}
-
-    if intent == "ayuda":
-        await send_message(
-            chat_id,
-            "Comandos:\n"
-            "• hola / ayuda / info\n"
-            "• municipio <Nombre>  (ej. *municipio Tulancingo*)\n"
-            "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat."
-        )
-        return {"ok": True}
-
-    if intent == "info":
-        await send_message(chat_id, "Consulto el conteo por municipio desde una hoja de Google Sheets publicada.")
-        return {"ok": True}
-
-    if intent == "municipio":
-        if not SHEETS_CSV_URL:
-            await send_message(chat_id, "Aún no tengo configurada la hoja (SHEETS_CSV_URL).")
+    try:
+        update = await request.json()
+        message = update.get("message") or {}
+        text = message.get("text")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if not chat_id:
             return {"ok": True}
 
-        chat_key = str(chat_id)
-        ya_registrado = get_user_municipio(chat_key)
+        intent = detect_intent(text or "")
 
-        if ya_registrado:
-            n = await get_municipio_count(ya_registrado)
+        if intent == "saludo":
             await send_message(
                 chat_id,
-                f"Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n"
-                "Si crees que es un error, solicita a un administrador que lo restablezca."
+                "¡Hola! Soy tu asistente del Plan Estatal de Desarrollo.\n"
+                "Escribe *municipio Pachuca* (por ejemplo) para ver su conteo.\n"
+                "Nota: Solo puedes registrar *un municipio* por chat."
             )
             return {"ok": True}
 
-        nombre = extract_municipio(text or "")
-        if not nombre:
-            await send_message(chat_id, "Escríbeme así: *municipio Pachuca*")
+        if intent == "ayuda":
+            await send_message(
+                chat_id,
+                "Comandos:\n"
+                "• hola / ayuda / info\n"
+                "• municipio <Nombre>  (ej. *municipio Tulancingo*)\n"
+                "Importante: Podrás consultar *solo el primer municipio* que elijas en este chat."
+            )
             return {"ok": True}
 
-        n = await get_municipio_count(nombre)
-        counts = await get_counts_cached()
-        elegido = nombre
-        for k in counts.keys():
-            if normalize(k) == normalize(nombre) or normalize(nombre) in normalize(k):
-                elegido = k
-                break
+        if intent == "info":
+            await send_message(chat_id, "Consulto el conteo por municipio desde una hoja de Google Sheets publicada.")
+            return {"ok": True}
 
-        set_user_municipio(chat_key, elegido)
-        await send_message(chat_id, f"Listo ✅. Registré *{elegido}* para este chat.\nActualmente lleva {n} registro(s).")
+        if intent == "municipio":
+            if not SHEETS_CSV_URL:
+                await send_message(chat_id, "Aún no tengo configurada la hoja (SHEETS_CSV_URL).")
+                return {"ok": True}
+
+            chat_key = str(chat_id)
+            ya_registrado = get_user_municipio(chat_key)
+
+            if ya_registrado:
+                n = await get_municipio_count(ya_registrado)
+                await send_message(
+                    chat_id,
+                    f"Tu municipio registrado es *{ya_registrado}* y lleva {n} registro(s).\n"
+                    "Si crees que es un error, solicita a un administrador que lo restablezca."
+                )
+                return {"ok": True}
+
+            nombre = extract_municipio(text or "")
+            if not nombre:
+                await send_message(chat_id, "Escríbeme así: *municipio Pachuca*")
+                return {"ok": True}
+
+            n = await get_municipio_count(nombre)
+            counts = await get_counts_cached()
+            elegido = nombre
+            for k in counts.keys():
+                if normalize(k) == normalize(nombre) or normalize(nombre) in normalize(k):
+                    elegido = k
+                    break
+
+            set_user_municipio(chat_key, elegido)
+            await send_message(chat_id, f"Listo ✅. Registré *{elegido}* para este chat.\nActualmente lleva {n} registro(s).")
+            return {"ok": True}
+
+        await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe *ayuda* para ver opciones.")
         return {"ok": True}
 
-    await send_message(chat_id, "No entendí tu mensaje 🤔. Escribe *ayuda* para ver opciones.")
-    return {"ok": True}
+    except Exception as e:
+        # Logueamos pero NO levantamos excepción (evitamos 500)
+        print(f"[webhook] error: {e}")
+        return {"ok": True}
 
 # ========= Utilidades set/delete webhook =========
 async def _tg_set_webhook(url: str, secret: str = "") -> Dict[str, Any]:
