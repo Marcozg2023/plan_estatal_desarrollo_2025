@@ -167,7 +167,10 @@ def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str],
 # =========================
 def reply_keyboard() -> Dict[str, Any]:
     return {
-        "keyboard": [[{"text": "Empezar de nuevo"}, {"text": "Actualizar"}]],
+        "keyboard": [
+            [{"text": "Empezar de nuevo"}, {"text": "Actualizar datos"}],
+            [{"text": "/ayuda"}],  # si prefieres, también puedes renombrarlo a “Ayuda”
+        ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
@@ -274,19 +277,23 @@ async def telegram_webhook(
     t = text.strip().lower()
 
     # ---- Comandos ----
-    if t.startswith("Empezar de nuevo","/start"):
-        counts = await get_counts_cached()
-        total = sum(counts.values()) if counts else 0
-        await send_message(chat_id,
-            "¡Hola! 👋\n"
-            "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
-            "📍 *Escribe directamente el nombre del municipio*.\n\n"
-            "   No importa si omites acentos o mayúsculas. Ej.: `pachuca de soto`.\n\n"
-            f"📊 **Registros totales a nivel estatal: {total}**",
-            reply_markup=reply_keyboard())
-        return {"ok": True}
+  # Inicio (acepta texto del botón y el comando tradicional)
+if t in ("empezar de nuevo", "/start"):
+    counts = await get_counts_cached()
+    total = sum(counts.values()) if counts else 0
+    await send_message(
+        chat_id,
+        "¡Hola! 👋\n"
+        "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
+        "📍 *Escribe directamente el nombre del municipio*.\n\n"
+        "   No importa si omites acentos o mayúsculas. Ej.: `pachuca de soto`.\n\n"
+        f"📊 **Registros totales a nivel estatal: {total}**",
+        reply_markup=reply_keyboard()
+    )
+    return {"ok": True}
 
-    if t.startswith("Actualizar","/ayuda"):
+
+    if t.startswith("/ayuda"):
         await send_message(chat_id,
             "🧭 *Menú de ayuda*\n\n"
             "• Para consultar: *escribe solo el nombre del municipio*. Ej.: `pachuca de soto`.\n"
@@ -296,10 +303,17 @@ async def telegram_webhook(
             reply_markup=reply_keyboard())
         return {"ok": True}
 
-    if t.startswith("/refrescar"):
-        await get_counts_cached(force=True)
-        await send_message(chat_id, "🔄 Cache actualizado.", reply_markup=reply_keyboard())
-        return {"ok": True}
+  # Refrescar datos (cache bust + feedback con total)
+if t in ("actualizar datos", "/refrescar"):
+    counts = await get_counts_cached(force=True)
+    total = sum(counts.values()) if counts else 0
+    await send_message(
+        chat_id,
+        f"🔄 Cache actualizado. Registros totales: {total}",
+        reply_markup=reply_keyboard()
+    )
+    return {"ok": True}
+
 
     if t.startswith("/id"):
         await send_message(chat_id, f"🆔 *user_id*: `{user_id}`\n💬 *chat_id*: `{chat_id}`")
