@@ -280,7 +280,7 @@ async def telegram_webhook(
         await send_message(chat_id,
             "¡Hola! 👋\n"
             "Soy tu asistente para la **Actualización del Plan Estatal de Desarrollo 2025-2028**.\n\n"
-            "📍 *Escribe directamente el nombre del municipio* (no necesitas poner 'municipio').\n"
+            "📍 *Escribe directamente el nombre del municipio*.\n\n"
             "   No importa si omites acentos o mayúsculas. Ej.: `pachuca de soto`.\n\n"
             f"📊 **Registros totales a nivel estatal: {total}**",
             reply_markup=reply_keyboard())
