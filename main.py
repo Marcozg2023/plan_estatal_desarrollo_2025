@@ -12,9 +12,9 @@ from fastapi.responses import JSONResponse
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "1022676234")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # <-- tu user_id
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", ""))  # <-- tu user_id
 
 SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()
 SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip()
