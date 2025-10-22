@@ -8,7 +8,7 @@ import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Chatbot PED Hidalgo", version="3.1")
+app = FastAPI(title="Chatbot PED Hidalgo", version="3.3-whitelist-adminbutton")
 
 # =========================
 # Config / Constantes
@@ -68,6 +68,13 @@ def init_db():
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS whitelist (
+        user_id INTEGER PRIMARY KEY,
+        note TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
     conn.commit()
     conn.close()
 
@@ -96,6 +103,34 @@ def get_user_municipio(chat_id: str) -> Optional[str]:
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
+def whitelist_add(user_id: int, note: str = "") -> None:
+    conn = db()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO whitelist(user_id, note) VALUES (?, ?)", (user_id, note))
+    conn.commit()
+    conn.close()
+
+def whitelist_remove(user_id: int) -> int:
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+    n = c.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+def whitelist_has(user_id: int) -> bool:
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM whitelist WHERE user_id = ? LIMIT 1", (user_id,))
+    ok = c.fetchone() is not None
+    conn.close()
+    return ok
+
+def is_privileged(user_id: int) -> bool:
+    # Pueden cambiar el municipio en un chat: admin o usuarios en whitelist
+    return (user_id == ADMIN_USER_ID) or whitelist_has(user_id)
 
 # =========================
 # Utilidades: normalización y fuzzy
@@ -192,8 +227,11 @@ def reply_keyboard() -> Dict[str, Any]:
 def inline_consultar_de_nuevo(muni: str) -> Dict[str, Any]:
     return {"inline_keyboard": [[{"text": "🔄 Consultar de nuevo", "callback_data": f"consultar:{muni}"}]]}
 
-def inline_only_corregir() -> Dict[str, Any]:
-    return {"inline_keyboard": [[{"text": "🧹 Corregir municipio", "callback_data": "invalid_reset"}]]}
+# ✅ Botón “Corregir municipio” solo si el usuario es admin
+def inline_corregir_if_admin(user_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if user_id == ADMIN_USER_ID:
+        return {"inline_keyboard": [[{"text": "🧹 Corregir municipio", "callback_data": "invalid_reset"}]]}
+    return None  # no mostrar nada a usuarios no admin
 
 async def send_message(chat_id: int, text: str,
                        parse_mode: Optional[str] = "Markdown",
@@ -269,7 +307,7 @@ async def telegram_webhook(
             )
             return {"ok": True}
 
-        # 🔒 El botón "Corregir municipio" (invalid_reset) solo puede ejecutarlo el admin
+        # 🔒 invalid_reset: solo admin
         if data == "invalid_reset" and chat_id:
             if from_id != ADMIN_USER_ID:
                 await answer_cb()
@@ -299,6 +337,35 @@ async def telegram_webhook(
 
     t = text.strip().lower()
 
+    # ---- Comandos admin de whitelist ----
+    if t.startswith("/permit"):
+        if user_id != ADMIN_USER_ID:
+            await send_message(chat_id, "⚠️ Solo el administrador puede usar este comando.")
+            return {"ok": True}
+        parts = text.split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await send_message(chat_id, "Uso: /permit <user_id> [nota opcional]")
+            return {"ok": True}
+        target_id = int(parts[1].strip())
+        note = parts[2].strip() if len(parts) > 2 else ""
+        whitelist_add(target_id, note)
+        await send_message(chat_id, f"✅ Usuario {target_id} agregado a la whitelist.")
+        return {"ok": True}
+
+    if t.startswith("/unpermit"):
+        if user_id != ADMIN_USER_ID:
+            await send_message(chat_id, "⚠️ Solo el administrador puede usar este comando.")
+            return {"ok": True}
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await send_message(chat_id, "Uso: /unpermit <user_id>")
+            return {"ok": True}
+        target_id = int(parts[1].strip())
+        n = whitelist_remove(target_id)
+        msg = f"✅ Usuario {target_id} eliminado de la whitelist." if n else f"ℹ️ {target_id} no estaba en la whitelist."
+        await send_message(chat_id, msg)
+        return {"ok": True}
+
     # ---- Comandos / equivalentes de botones ----
     if t in ("empezar de nuevo", "/start"):
         counts = await get_counts_cached()
@@ -322,8 +389,8 @@ async def telegram_webhook(
             "• No importa si no pones acentos o mayúsculas.\n"
             "• Para refrescar los datos: *Actualizar datos* o */refrescar*\n"
             "• Para ver tus IDs: */id*\n\n"
-            "📌 Primero valido contra el *listado oficial de 84 municipios* (con sugerencias). "
-            "Después consulto el CSV; si no hay fila, muestro 0.",
+            "📌 Regla: 1 chat = 1 municipio.\n"
+            "   Si necesitas cambiarlo, contacta al administrador o solicita permiso temporal.",
             reply_markup=reply_keyboard()
         )
         return {"ok": True}
@@ -367,19 +434,19 @@ async def telegram_webhook(
                 chat_id,
                 f"⚠️ No encontré *{nombre}* en la lista oficial de municipios.\n\n"
                 "Verifica la ortografía o corrígelo.",
-                reply_markup=inline_only_corregir()
+                reply_markup=inline_corregir_if_admin(user_id)  # 👈 solo admin ve el botón
             )
             return {"ok": True}
 
         oficial = exacto or sugerido
         actual = get_user_municipio(str(chat_id))
 
-        # 🔒 Regla: si ya hay municipio y quieren cambiar a otro, solo admin puede
-        if actual and normalize(actual) != normalize(oficial) and user_id != ADMIN_USER_ID:
+        # 🔒 Regla: si ya hay municipio distinto y NO es privilegiado → bloquear cambio
+        if actual and normalize(actual) != normalize(oficial) and not is_privileged(user_id):
             await send_message(
                 chat_id,
                 f"🔒 Este chat ya está asociado a *{actual}*.\n"
-                "Solo un administrador puede cambiarlo.",
+                "Solo un administrador o un usuario con permiso puede cambiarlo.",
                 reply_markup=inline_consultar_de_nuevo(actual)
             )
             return {"ok": True}
@@ -395,7 +462,7 @@ async def telegram_webhook(
         )
         return {"ok": True}
 
-    # ---- Texto libre: intentar como municipio
+    # ---- Texto libre: intentar como municipio (con misma regla)
     if not t.startswith("/"):
         nombre = text
         if len(normalize(nombre)) >= 3:
@@ -404,12 +471,11 @@ async def telegram_webhook(
                 oficial = exacto or sugerido
                 actual = get_user_municipio(str(chat_id))
 
-                # 🔒 Regla: si ya hay municipio y quieren cambiar a otro, solo admin puede
-                if actual and normalize(actual) != normalize(oficial) and user_id != ADMIN_USER_ID:
+                if actual and normalize(actual) != normalize(oficial) and not is_privileged(user_id):
                     await send_message(
                         chat_id,
                         f"🔒 Este chat ya está asociado a *{actual}*.\n"
-                        "Solo un administrador puede cambiarlo.",
+                        "Solo un administrador o un usuario con permiso puede cambiarlo.",
                         reply_markup=inline_consultar_de_nuevo(actual)
                     )
                     return {"ok": True}
@@ -421,6 +487,15 @@ async def telegram_webhook(
                     chat_id,
                     f"✅ Registré *{oficial}* para este chat.\n\nActualmente lleva {n} registro(s).",
                     reply_markup=inline_consultar_de_nuevo(oficial)
+                )
+                return {"ok": True}
+            else:
+                # Si ni exacto ni sugerido, muestra la opción de corregir SOLO a admin
+                await send_message(
+                    chat_id,
+                    f"⚠️ No encontré *{nombre}* en la lista oficial de municipios.\n\n"
+                    "Verifica la ortografía o corrígelo.",
+                    reply_markup=inline_corregir_if_admin(user_id)  # 👈 solo admin
                 )
                 return {"ok": True}
 
