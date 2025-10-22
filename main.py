@@ -2,30 +2,32 @@
 from __future__ import annotations
 
 import os, re, time, csv, io, sqlite3, unicodedata
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
+app = FastAPI(title="Chatbot PED Hidalgo", version="3.1")
+
 # =========================
-# Variables de entorno
+# Config / Constantes
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "1022676234"))  # tu user_id (cámbialo si deseas)
+
+# 🔒 Admin (tú)
+ADMIN_USER_ID = 1022676234
 
 SHEETS_CSV_URL = os.getenv("SHEETS_CSV_URL", "").strip()
 SHEETS_FIELD_MUNICIPIO = os.getenv("SHEETS_FIELD_MUNICIPIO", "Municipio").strip()
 SHEETS_CACHE_TTL = int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "120"))
 DB_PATH = os.getenv("DB_PATH", "./chatbot.db")
 
-app = FastAPI(title="Chatbot PED Hidalgo", version="2.5")
-
 # =========================
-# Listado oficial (84 municipios)
+# Municipios oficiales (84)
 # =========================
 MUNICIPIOS_OFICIALES = [
     "Acatlán","Acaxochitlán","Actopan","Agua Blanca de Iturbide","Ajacuba","Alfajayucan",
@@ -87,8 +89,16 @@ def reset_user_municipio(chat_id: str) -> int:
     conn.close()
     return n
 
+def get_user_municipio(chat_id: str) -> Optional[str]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT municipio FROM user_municipio WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
 # =========================
-# Utilidades de normalización y CSV
+# Utilidades: normalización y fuzzy
 # =========================
 def strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s or "") if unicodedata.category(ch) != "Mn")
@@ -97,6 +107,34 @@ def normalize(s: str) -> str:
     base = strip_accents((s or "").strip().lower())
     return re.sub(r"\s+", " ", base)
 
+def _levenshtein(a: str, b: str) -> int:
+    a, b = normalize(a), normalize(b)
+    if a == b: return 0
+    if not a: return len(b)
+    if not b: return len(a)
+    prev = list(range(len(b)+1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            curr.append(min(prev[j]+1, curr[j-1]+1, prev[j-1] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
+    t = normalize(user_text)
+    for m in MUNICIPIOS_OFICIALES:
+        if t == normalize(m):
+            return m, None
+    mejor, dist = None, 999
+    for m in MUNICIPIOS_OFICIALES:
+        d = _levenshtein(t, m)
+        if d < dist:
+            mejor, dist = m, d
+    return (None, mejor) if (mejor and dist <= max_dist) else (None, None)
+
+# =========================
+# Sheets cache
+# =========================
 _cache_counts: Dict[str, int] = {}
 _cache_last_fetch: float = 0.0
 
@@ -108,14 +146,10 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
     if not SHEETS_CSV_URL:
         return {}
     try:
-        # cache-buster
         bust = str(int(time.time()))
         sep = "&" if "?" in SHEETS_CSV_URL else "?"
         url = f"{SHEETS_CSV_URL}{sep}_={bust}"
-        headers = {
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
+        headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             r = await client.get(url, headers=headers)
         if r.status_code != 200:
@@ -132,9 +166,6 @@ async def fetch_counts_from_sheets() -> Dict[str, int]:
     return counts
 
 async def get_counts_cached(force: bool = False) -> Dict[str, int]:
-    """
-    Devuelve el conteo con TTL. Si force=True, ignora cache y recarga.
-    """
     global _cache_counts, _cache_last_fetch
     now = time.time()
     if force or (now - _cache_last_fetch > SHEETS_CACHE_TTL) or not _cache_counts:
@@ -145,46 +176,13 @@ async def get_counts_cached(force: bool = False) -> Dict[str, int]:
     return _cache_counts
 
 # =========================
-# Fuzzy matching (oficial primero)
-# =========================
-def _levenshtein(a: str, b: str) -> int:
-    a, b = normalize(a), normalize(b)
-    if a == b: return 0
-    if not a: return len(b)
-    if not b: return len(a)
-    prev = list(range(len(b)+1))
-    for i, ca in enumerate(a, 1):
-        curr = [i]
-        for j, cb in enumerate(b, 1):
-            curr.append(min(prev[j]+1, curr[j-1]+1, prev[j-1] + (ca != cb)))
-        prev = curr
-    return prev[-1]
-
-def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Devuelve (exacto, sugerido) contra el listado oficial:
-    - exacto: nombre oficial exacto si coincide (ignora acentos/mayúsculas)
-    - sugerido: mejor match si la distancia <= max_dist
-    """
-    t = normalize(user_text)
-    for m in MUNICIPIOS_OFICIALES:
-        if t == normalize(m):
-            return m, None
-    mejor, dist = None, 999
-    for m in MUNICIPIOS_OFICIALES:
-        d = _levenshtein(t, m)
-        if d < dist:
-            mejor, dist = m, d
-    return (None, mejor) if (mejor and dist <= max_dist) else (None, None)
-
-# =========================
 # Telegram helpers
 # =========================
 def reply_keyboard() -> Dict[str, Any]:
     return {
         "keyboard": [
             [{"text": "Empezar de nuevo"}, {"text": "Actualizar datos"}],
-            [{"text": "/ayuda"}],  # si prefieres, puedes renombrarlo a "Ayuda" y tratarlo igual
+            [{"text": "/ayuda"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -243,6 +241,7 @@ async def telegram_webhook(
         data = callback.get("data") or ""
         message = callback.get("message") or {}
         chat_id = ((message.get("chat") or {}).get("id")) or None
+        from_id = (callback.get("from") or {}).get("id")
 
         async def answer_cb(text: Optional[str] = None, alert: bool = False):
             if not API_URL or not cb_id: return
@@ -270,7 +269,12 @@ async def telegram_webhook(
             )
             return {"ok": True}
 
+        # 🔒 El botón "Corregir municipio" (invalid_reset) solo puede ejecutarlo el admin
         if data == "invalid_reset" and chat_id:
+            if from_id != ADMIN_USER_ID:
+                await answer_cb()
+                await send_message(chat_id, "🔒 Solo un administrador puede restablecer el municipio de este chat.")
+                return {"ok": True}
             reset_user_municipio(str(chat_id))
             await answer_cb()
             await send_message(
@@ -296,7 +300,6 @@ async def telegram_webhook(
     t = text.strip().lower()
 
     # ---- Comandos / equivalentes de botones ----
-    # Inicio (acepta texto del botón y el comando tradicional)
     if t in ("empezar de nuevo", "/start"):
         counts = await get_counts_cached()
         total = sum(counts.values()) if counts else 0
@@ -325,7 +328,6 @@ async def telegram_webhook(
         )
         return {"ok": True}
 
-    # Refrescar datos (cache-bust + feedback con total)
     if t in ("actualizar datos", "/refrescar"):
         counts = await get_counts_cached(force=True)
         total = sum(counts.values()) if counts else 0
@@ -341,8 +343,7 @@ async def telegram_webhook(
         return {"ok": True}
 
     if t.startswith("/reset"):
-        # Admin por user_id; acepta opcional /reset <chat_id_objetivo>
-        if ADMIN_CHAT_ID and user_id == ADMIN_CHAT_ID:
+        if user_id == ADMIN_USER_ID:
             parts = text.split()
             target_chat = str(chat_id)
             if len(parts) > 1:
@@ -357,7 +358,7 @@ async def telegram_webhook(
             await send_message(chat_id, "⚠️ Este comando es solo para administradores.")
         return {"ok": True}
 
-    # ---- Intent: compatibilidad con "municipio ..." (se mantiene)
+    # ---- Compatibilidad "municipio ..."
     if t.startswith("municipio"):
         nombre = text.split(" ", 1)[1] if " " in text else ""
         exacto, sugerido = validar_municipio(nombre)
@@ -369,22 +370,23 @@ async def telegram_webhook(
                 reply_markup=inline_only_corregir()
             )
             return {"ok": True}
-        if sugerido and not exacto:
+
+        oficial = exacto or sugerido
+        actual = get_user_municipio(str(chat_id))
+
+        # 🔒 Regla: si ya hay municipio y quieren cambiar a otro, solo admin puede
+        if actual and normalize(actual) != normalize(oficial) and user_id != ADMIN_USER_ID:
             await send_message(
                 chat_id,
-                f"⚠️ No encontré *{nombre}* en la lista oficial.\n\n"
-                f"¿Quisiste decir *{sugerido}*?\n\n"
-                "Si fue un error, corrígelo:",
-                reply_markup=inline_only_corregir()
+                f"🔒 Este chat ya está asociado a *{actual}*.\n"
+                "Solo un administrador puede cambiarlo.",
+                reply_markup=inline_consultar_de_nuevo(actual)
             )
             return {"ok": True}
-        oficial = exacto or sugerido
+
+        # Registrar/consultar
         counts = await get_counts_cached()
-        n = 0
-        for k, v in counts.items():
-            if normalize(k) == normalize(oficial):
-                n = v
-                break
+        n = next((v for k, v in counts.items() if normalize(k) == normalize(oficial)), 0)
         set_user_municipio(str(chat_id), oficial)
         await send_message(
             chat_id,
@@ -393,19 +395,27 @@ async def telegram_webhook(
         )
         return {"ok": True}
 
-    # ---- NUEVO: si no es comando, intentamos interpretar TODO el texto como municipio
+    # ---- Texto libre: intentar como municipio
     if not t.startswith("/"):
-        nombre = text  # todo el texto del usuario
+        nombre = text
         if len(normalize(nombre)) >= 3:
             exacto, sugerido = validar_municipio(nombre)
             if exacto or sugerido:
                 oficial = exacto or sugerido
+                actual = get_user_municipio(str(chat_id))
+
+                # 🔒 Regla: si ya hay municipio y quieren cambiar a otro, solo admin puede
+                if actual and normalize(actual) != normalize(oficial) and user_id != ADMIN_USER_ID:
+                    await send_message(
+                        chat_id,
+                        f"🔒 Este chat ya está asociado a *{actual}*.\n"
+                        "Solo un administrador puede cambiarlo.",
+                        reply_markup=inline_consultar_de_nuevo(actual)
+                    )
+                    return {"ok": True}
+
                 counts = await get_counts_cached()
-                n = 0
-                for k, v in counts.items():
-                    if normalize(k) == normalize(oficial):
-                        n = v
-                        break
+                n = next((v for k, v in counts.items() if normalize(k) == normalize(oficial)), 0)
                 set_user_municipio(str(chat_id), oficial)
                 await send_message(
                     chat_id,
