@@ -274,7 +274,7 @@ async def telegram_webhook(
     t = text.strip().lower()
 
     # ---- Comandos ----
-    if t.startswith("/start"):
+    if t.startswith("Empezar de nuevo","/start"):
         counts = await get_counts_cached()
         total = sum(counts.values()) if counts else 0
         await send_message(chat_id,
@@ -286,7 +286,7 @@ async def telegram_webhook(
             reply_markup=reply_keyboard())
         return {"ok": True}
 
-    if t.startswith("/ayuda"):
+    if t.startswith("Actualizar","/ayuda"):
         await send_message(chat_id,
             "🧭 *Menú de ayuda*\n\n"
             "• Para consultar: *escribe solo el nombre del municipio*. Ej.: `pachuca de soto`.\n"
