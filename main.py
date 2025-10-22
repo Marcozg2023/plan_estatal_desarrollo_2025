@@ -167,7 +167,7 @@ def validar_municipio(user_text: str, max_dist: int = 2) -> Tuple[Optional[str],
 # =========================
 def reply_keyboard() -> Dict[str, Any]:
     return {
-        "keyboard": [[{"text": "/ayuda"}, {"text": "/refrescar"}]],
+        "keyboard": [[{"text": "Empezar de nuevo"}, {"text": "Actualizar"}]],
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
