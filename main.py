@@ -292,8 +292,7 @@ async def telegram_webhook(
             "• Para consultar: *escribe solo el nombre del municipio*. Ej.: `pachuca de soto`.\n"
             "• No importa si no pones acentos o mayúsculas.\n"
             "• Para refrescar los datos: */refrescar*\n"
-            "• Para ver tus IDs: */id*\n\n"
-            "📌 Primero valido contra el *listado oficial de 84 municipios* (con sugerencias). Después consulto el CSV; si no hay fila, muestro 0.",
+            "• Para ver tus IDs: */id*\n\n",
             reply_markup=reply_keyboard())
         return {"ok": True}
 
